@@ -1,0 +1,10 @@
+services:
+  postgres:
+    image: 'postgres:latest'
+    container_name: posgres-DentalBot
+    environment:
+      - 'POSTGRES_DB=${DATABASE_DB}'
+      - 'POSTGRES_USER=${PRODUCTION_USERNAME_DB}'
+      - 'POSTGRES_PASSWORD=${PRODUCTION_PASSWORD_DB}'
+    ports:
+      - '5433:5432'
