@@ -1,4 +1,4 @@
-package com.example.Project1.config;
+package com.example.Project1.Config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
@@ -7,10 +7,10 @@ import org.springframework.context.annotation.Configuration;
 @ConfigurationProperties(prefix = "whatsapp")
 public class WhatsAppProperties {
 
-    private String apiUrl = "https://graph.facebook.com/v21.0";
-    private String phoneNumberId;
-    private String accessToken;
-    private String verifyToken = "DentalClinicSecretToken2026";
+    private String apiUrl = "https://graph.facebook.com/v26.0";
+    private String phoneNumberId = "${WHATSAPP_PHONE_NUMBER_ID}";
+    private String accessToken = "${WHATSAPP_ACCESS_TOKEN}";
+    private String verifyToken = "${WHATSAPP_VERIFY_TOKEN}";
     private Doctor doctor = new Doctor();
 
     public static class Doctor {

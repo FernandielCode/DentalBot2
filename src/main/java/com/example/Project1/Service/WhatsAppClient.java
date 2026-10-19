@@ -1,7 +1,7 @@
 package com.example.Project1.Service;
 
 import com.example.Project1.Model.DTO.SendMessageRequest;
-import com.example.Project1.config.WhatsAppProperties;
+import com.example.Project1.Config.WhatsAppProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;

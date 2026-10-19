@@ -2,7 +2,7 @@ package com.example.Project1.Service;
 
 import com.example.Project1.Model.DTO.WhatsAppWebhookPayload;
 import com.example.Project1.Model.Entity.*;
-import com.example.Project1.config.WhatsAppProperties;
+import com.example.Project1.Config.WhatsAppProperties;
 import com.example.Project1.repository.*;
 import jakarta.transaction.Transactional;
 import org.slf4j.Logger;

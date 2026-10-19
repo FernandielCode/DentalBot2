@@ -2,7 +2,7 @@ package com.example.Project1.Controller;
 
 import com.example.Project1.Model.DTO.WhatsAppWebhookPayload;
 import com.example.Project1.Service.WhatsAppBotService;
-import com.example.Project1.config.WhatsAppProperties;
+import com.example.Project1.Config.WhatsAppProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
