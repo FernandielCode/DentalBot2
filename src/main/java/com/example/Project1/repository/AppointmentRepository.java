@@ -1,6 +1,8 @@
 package com.example.Project1.repository;
 
 import com.example.Project1.Model.Entity.Appointment;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
@@ -11,4 +13,7 @@ import java.util.UUID;
 public interface AppointmentRepository extends JpaRepository<Appointment, UUID> {
     List<Appointment> findByAppointmentStatus(String appointmentStatus);
     List<Appointment> findByPatientAppointment_PatientUUID(UUID patientUUID);
+
+    // Paginated query: retrieves appointments ordered from most recent to oldest
+    Page<Appointment> findAllByOrderByCreatedAtDesc(Pageable pageable);
 }

@@ -30,16 +30,23 @@ public class Patient {
     @OneToMany(mappedBy = "patientAppointment")
     private List<Appointment> patientAppointmentList;
 
+    @Enumerated(EnumType.STRING)
+    @Column(name = "patient_state", nullable = false)
+    private PatientState patientState;
+
     public Patient() {
     }
 
-    public Patient(UUID patientUUID, int patientNumber, String patientName, String patientLastname, String patientPhone, Integer patientAge) {
+    public Patient(UUID patientUUID, int patientNumber, String patientName,
+                   String patientLastname, String patientPhone, Integer patientAge,
+                   PatientState patientState) {
         this.patientUUID = patientUUID;
         this.patientNumber = patientNumber;
         this.patientName = patientName;
         this.patientLastname = patientLastname;
         this.patientPhone = patientPhone;
         this.patientAge = patientAge;
+        this.patientState = patientState;
     }
 
     public UUID getPatientUUID() {
@@ -112,5 +119,13 @@ public class Patient {
 
     public void setPatientAppointmentList(List<Appointment> patientAppointmentList) {
         this.patientAppointmentList = patientAppointmentList;
+    }
+
+    public PatientState getPatientState() {
+        return patientState;
+    }
+
+    public void setPatientState(PatientState patientState) {
+        this.patientState = patientState;
     }
 }

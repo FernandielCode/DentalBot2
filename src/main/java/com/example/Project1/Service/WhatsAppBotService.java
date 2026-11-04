@@ -1,24 +1,34 @@
 package com.example.Project1.Service;
 
+import com.example.Project1.Config.WhatsAppProperties;
+import com.example.Project1.Model.DTO.SendInteractiveListRequest;
 import com.example.Project1.Model.DTO.WhatsAppWebhookPayload;
 import com.example.Project1.Model.Entity.*;
-import com.example.Project1.Config.WhatsAppProperties;
 import com.example.Project1.repository.*;
 import jakarta.transaction.Transactional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 
 import java.sql.Timestamp;
+import java.text.SimpleDateFormat;
 import java.time.DayOfWeek;
 import java.time.LocalDate;
-import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
+/**
+ * Core business service managing the conversational state machine for the WhatsApp bot.
+ * Handles both patient appointment intake workflows and doctor administrative commands.
+ */
 @Service
 public class WhatsAppBotService {
     private static final Logger log = LoggerFactory.getLogger(WhatsAppBotService.class);
@@ -28,6 +38,7 @@ public class WhatsAppBotService {
     private final WhatsAppContactRepository contactRepository;
     private final WhatsAppSessionRepository sessionRepository;
     private final WhatsAppMessageRepository messageRepository;
+    private final TreatmentsRepository treatmentsRepository;
     private final PatientRepository patientRepository;
     private final AppointmentRepository appointmentRepository;
     private final DentistRepository dentistRepository;
@@ -37,6 +48,7 @@ public class WhatsAppBotService {
                               WhatsAppContactRepository contactRepository,
                               WhatsAppSessionRepository sessionRepository,
                               WhatsAppMessageRepository messageRepository,
+                              TreatmentsRepository treatmentsRepository,
                               PatientRepository patientRepository,
                               AppointmentRepository appointmentRepository,
                               DentistRepository dentistRepository) {
@@ -45,11 +57,15 @@ public class WhatsAppBotService {
         this.contactRepository = contactRepository;
         this.sessionRepository = sessionRepository;
         this.messageRepository = messageRepository;
+        this.treatmentsRepository = treatmentsRepository;
         this.patientRepository = patientRepository;
         this.appointmentRepository = appointmentRepository;
         this.dentistRepository = dentistRepository;
     }
 
+    /**
+     * Entry point for processing raw incoming webhook payloads from Meta.
+     */
     @Transactional
     public void processWebhookEvent(WhatsAppWebhookPayload payload) {
         if (payload == null || payload.entry() == null) {
@@ -69,17 +85,23 @@ public class WhatsAppBotService {
         }
     }
 
+    /**
+     * Processes an individual incoming message, determining whether the sender
+     * is the Doctor (admin commands) or a Patient (appointment scheduling).
+     */
     private void handleIncomingMessage(WhatsAppWebhookPayload.IncomingMessage incomingMessage,
-                                       java.util.List<WhatsAppWebhookPayload.Contact> contacts) {
+                                        List<WhatsAppWebhookPayload.Contact> contacts) {
         String fromPhone = incomingMessage.from();
-        String messageBody = incomingMessage.text() != null ? incomingMessage.text().body() : "";
+        // Support both regular text and interactive button/list selections
+        String messageBody = incomingMessage.getExtractedText();
+
         if (fromPhone == null || messageBody == null || messageBody.isBlank()) {
             return;
         }
 
         log.info("Received WhatsApp message from [{}]: {}", fromPhone, messageBody);
 
-        // 1. Find or create Contact
+        // 1. Maintain Contact audit record
         WhatsAppContact contact = contactRepository.findByWaUserId(fromPhone)
                 .orElseGet(() -> {
                     WhatsAppContact newContact = new WhatsAppContact();
@@ -96,7 +118,21 @@ public class WhatsAppBotService {
         // Record incoming message in DB
         saveMessageRecord(contact, incomingMessage.id(), "INCOMING", messageBody);
 
-        // 2. Find or create Session
+        // -----------------------------------------------------------------------------------
+        // DOCTOR COMMANDS WORKFLOW
+        // If the sender is the clinic doctor, route to dedicated administrative handlers
+        // rather than processing them as a new patient.
+        // -----------------------------------------------------------------------------------
+        String doctorPhone = properties.getDoctor() != null ? properties.getDoctor().getPhoneNumber() : null;
+        if (doctorPhone != null && !doctorPhone.isBlank() && fromPhone.equals(doctorPhone)) {
+            if (handleDoctorMessage(doctorPhone, incomingMessage, messageBody)) {
+                return;
+            }
+        }
+
+        // -----------------------------------------------------------------------------------
+        // PATIENT INTAKE CONVERSATIONAL STATE MACHINE
+        // -----------------------------------------------------------------------------------
         WhatsAppSession session = sessionRepository.findByWhatsAppContact_WaUserId(fromPhone)
                 .orElseGet(() -> {
                     WhatsAppSession newSession = new WhatsAppSession();
@@ -109,7 +145,7 @@ public class WhatsAppBotService {
         String state = session.getCurrentState() != null ? session.getCurrentState() : "INITIAL";
 
         if ("INITIAL".equalsIgnoreCase(state) || "COMPLETED".equalsIgnoreCase(state)) {
-            // STEP 1 & 2: Patient types to the bot -> Bot responds asking for their information
+            // STEP 1 & 2: Patient greets the bot -> Bot responds asking for their full name & age
             String greetingPrompt = "Hello! Welcome to Dental Clinic.\n"
                     + "Please reply with your *Full Name* and *Age* (for example: *John Doe, 28*) so we can schedule your appointment with the Doctor.";
 
@@ -121,7 +157,7 @@ public class WhatsAppBotService {
             sessionRepository.save(session);
 
         } else if ("AWAITING_PATIENT_INFO".equalsIgnoreCase(state)) {
-            // STEP 3: Patient responds with their information
+            // STEP 3: Patient replies with their details
             ParsedPatientInfo parsedInfo = parsePatientInfo(messageBody);
 
             if (parsedInfo == null || parsedInfo.name == null || parsedInfo.age == null) {
@@ -131,7 +167,7 @@ public class WhatsAppBotService {
                 return;
             }
 
-            // Save/Update Patient in DB
+            // Save or update Patient entity in DB
             Patient patient = patientRepository.findByPatientPhone(fromPhone)
                     .orElseGet(() -> {
                         Patient newPatient = new Patient();
@@ -146,47 +182,186 @@ public class WhatsAppBotService {
             contact.setPatientContact(patient);
             contactRepository.save(contact);
 
-            // Compute suggested appointment slots
+            // Compute suggested appointment slot (next available business day at 10 AM)
             String suggestedAppointment = generateSuggestedAppointment();
 
-            // Create Appointment record
+            // Create pending Appointment record
             Appointment appointment = new Appointment();
             appointment.setPatientAppointment(patient);
             appointment.setCategory("Consultation");
             appointment.setAppointmentStatus("PENDING");
             appointment.setNotes("Suggested: " + suggestedAppointment);
             appointment.setCreatedAt(new Timestamp(System.currentTimeMillis()));
-            // Default slot timestamp: tomorrow at 10 AM
             appointment.setStartAppointmentAt(Timestamp.valueOf(LocalDate.now().plusDays(1).atTime(10, 0)));
+            appointment.setPatientState(PatientState.UNDEFINED);
 
-            // Assign default active dentist if exists
+            // Assign default active dentist if configured
             Optional<Dentist> activeDentist = dentistRepository.findFirstByIsDentistActiveTrue();
             activeDentist.ifPresent(appointment::setDentistAppointment);
 
             appointmentRepository.save(appointment);
 
-            // Confirm receipt to patient
+            // Acknowledge receipt to the Patient
             String patientAck = "Thank you, " + parsedInfo.name + "! We have received your information and notified the Doctor to confirm your appointment time.";
             whatsAppClient.sendTextMessage(fromPhone, patientAck);
             saveMessageRecord(contact, null, "OUTGOING", patientAck);
 
-            // Send formatted message to Doctor's WhatsApp contact:
-            // "The patient [name of patient] with age [number age], When would you like to schedule the appointment of this patient?, here are some suggested appointments: [suggested appointment 1]"
+            // Forward notification to the Doctor
             String doctorMessage = "The patient " + parsedInfo.name + " with age " + parsedInfo.age
                     + ", When would you like to schedule the appointment of this patient?, here are some suggested appointments: "
                     + suggestedAppointment;
 
-            String doctorPhone = properties.getDoctor() != null ? properties.getDoctor().getPhoneNumber() : null;
-            if (doctorPhone == null || doctorPhone.isBlank()) {
-                doctorPhone = fromPhone; // Fallback to sender during testing if not set
-            }
-
-            whatsAppClient.sendTextMessage(doctorPhone, doctorMessage);
-            log.info("Forwarded patient details to Doctor ({})", doctorPhone);
+            String recipientDoctor = (doctorPhone != null && !doctorPhone.isBlank()) ? doctorPhone : fromPhone;
+            whatsAppClient.sendTextMessage(recipientDoctor, doctorMessage);
+            log.info("Forwarded patient details to Doctor ({})", recipientDoctor);
 
             session.setCurrentState("COMPLETED");
             session.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
             sessionRepository.save(session);
+        }
+    }
+
+    /**
+     * Handles administrative commands and interactive menu responses sent by the Doctor.
+     *
+     * @param doctorPhone The verified phone number of the doctor
+     * @param incomingMessage The incoming webhook message payload
+     * @param messageBody Text content of the message or selected menu option
+     * @return true if the message was handled as a doctor command, false to allow default flow
+     */
+    private boolean handleDoctorMessage(String doctorPhone,
+                                        WhatsAppWebhookPayload.IncomingMessage incomingMessage,
+                                        String messageBody) {
+
+        String selectedOptionId = incomingMessage.getInteractiveSelectionId();
+
+        // Command 1: Doctor types "citas" -> Display Page 0 (most recent 10 appointments)
+        if ("citas".equalsIgnoreCase(messageBody.trim())) {
+            showAppointmentsPage(doctorPhone, 0);
+            return true;
+        }
+
+        // Command 2: Doctor tapped "Ver más citas" -> Display the next page of older appointments
+        if (selectedOptionId != null && selectedOptionId.startsWith("CITAS_PAGE_")) {
+            try {
+                int nextPage = Integer.parseInt(selectedOptionId.replace("CITAS_PAGE_", ""));
+                showAppointmentsPage(doctorPhone, nextPage);
+            } catch (NumberFormatException e) {
+                log.error("Failed to parse page number from action id: {}", selectedOptionId, e);
+            }
+            return true;
+        }
+
+        // Command 3: Doctor types "PAGO" -> Present an interactive list of treatments
+        if ("PAGO".equalsIgnoreCase(messageBody.trim())) {
+            List<SendInteractiveListRequest.Row> treatmentRows = treatmentsRepository.getAllTreatmentsIgnoreCase();
+
+            String prompt = "Doctor, por favor seleccione el tratamiento que recibió el paciente:";
+            String buttonTreatmentText = "Ver Tratamientos";
+
+            whatsAppClient.sendInteractiveList(doctorPhone, prompt, buttonTreatmentText, treatmentRows);
+            log.info("Dispatched interactive treatment list to Doctor ({})", doctorPhone);
+            return true;
+        }
+
+        // Command 4: Doctor tapped an option from the Interactive List Menu
+        String selectedTreatmentId = incomingMessage.getInteractiveSelectionId();
+        if (selectedTreatmentId != null) {
+            log.info("Doctor selected treatment option: id={}, title={}", selectedTreatmentId, messageBody);
+            String confirmationText = "Tratamiento registrado con éxito: *" + messageBody + "*.\n"
+                    + "El pago del paciente es de: $"+treatmentsRepository.findPriceByTreatmentId(selectedTreatmentId);
+            whatsAppClient.sendTextMessage(doctorPhone, confirmationText);
+
+            // Command 5: Bot asks the doctor what method of payment did the patient selected, and if the patient paid the full price or partially
+
+            String promptForPayment = "De qué forma realizó el pago el paciente?: \n";
+            String buttonTextPayment = "Ver métodos de pago";
+            String selectedPaymentMethodId = incomingMessage.getInteractiveSelectionId();
+            List<SendInteractiveListRequest.Row> paymentMethods =List.of(
+                    new SendInteractiveListRequest.Row("PAY_TRANSFERENCIA","TRANSFERENCIA", "Por Banca móvil de cualquier banco"),
+                    new SendInteractiveListRequest.Row("PAY_EFECTIVO","EFECTIVO","Billetes/monedas")
+            );
+            whatsAppClient.sendInteractiveList(doctorPhone,promptForPayment,buttonTextPayment,paymentMethods);
+            if (selectedPaymentMethodId.equals("PAY_TRANSFERENCIA")){
+                String promptConfirmCompletePayment= "El Paciente ha pagado todo, parcialmente, o queda debiéndole?";
+                whatsAppClient.sendTextMessage(doctorPhone,promptConfirmCompletePayment);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Renders up to 10 appointments per page with formatted details and a "Ver más citas" pagination button.
+     *
+     * @param doctorPhone Recipient phone number of the doctor
+     * @param pageNumber Zero-based page index (0 = first 10, 1 = next 10, etc.)
+     */
+    private void showAppointmentsPage(String doctorPhone, int pageNumber) {
+        int pageSize = 10;
+        Page<Appointment> appointmentPage = appointmentRepository.findAllByOrderByCreatedAtDesc(PageRequest.of(pageNumber, pageSize));
+
+        if (appointmentPage.isEmpty()) {
+            whatsAppClient.sendTextMessage(doctorPhone, "No se encontraron citas registradas.");
+            return;
+        }
+
+        SimpleDateFormat dateFormat = new SimpleDateFormat("dd/MM/yyyy");
+        SimpleDateFormat timeFormat = new SimpleDateFormat("hh:mma");
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("📋 *Citas (Página ").append(pageNumber + 1).append(" de ").append(appointmentPage.getTotalPages()).append(")*:\n\n");
+
+        int index = (pageNumber * pageSize) + 1;
+        for (Appointment appt : appointmentPage.getContent()) {
+            // Patient Name
+            String patientName = (appt.getPatientAppointment() != null && appt.getPatientAppointment().getPatientName() != null)
+                    ? appt.getPatientAppointment().getPatientName()
+                    : "Sin nombre";
+
+            // Treatments joined by " & "
+            String treatments = (appt.getTreatments() != null && !appt.getTreatments().isEmpty())
+                    ? appt.getTreatments().stream().map(Treatments::getTreatment).collect(Collectors.joining(" & "))
+                    : "Consulta general";
+
+            // Date and Time
+            String date = (appt.getStartAppointmentAt() != null) ? dateFormat.format(appt.getStartAppointmentAt()) : "Por definir";
+            String time = (appt.getStartAppointmentAt() != null) ? timeFormat.format(appt.getStartAppointmentAt()).toLowerCase() : "Por definir";
+
+            // State & Payment
+            String state = (appt.getPatientState() != null)
+                    ? appt.getPatientState().getPatientState()
+                    : PatientState.UNDEFINED.getPatientState();
+
+            String payment = (appt.getPaymentMethod() != null)
+                    // the first .getPaymentMethod is from the Appointment.java (from the PaymentMethod Class)
+                    // The second .getPaymentMethod is from  PaymentMethod Enum Class (String by itself)
+                    ? appt.getPaymentMethod().getPaymentMethod()
+                    : "Por definir";
+
+            sb.append(index).append(". ")
+              .append("Paciente: ").append(patientName).append(". ")
+              .append("Tratamiento: ").append(treatments).append(". ")
+              .append("última/próxima fecha: ").append(date).append(". ")
+              .append("Hora: ").append(time).append(". ")
+              .append("Estado: ").append(state).append(". ")
+              .append("Método de pago: ").append(payment).append(".\n\n");
+
+            index++;
+        }
+
+        // If there are more pages, append interactive button "Ver más citas"
+        if (appointmentPage.hasNext()) {
+            String nextPageButtonId = "CITAS_PAGE_" + (pageNumber + 1);
+            whatsAppClient.sendInteractiveButton(
+                    doctorPhone,
+                    sb.toString().trim(),
+                    "Ver más citas",
+                    nextPageButtonId
+            );
+        } else {
+            sb.append("🏁 _Fin del listado de citas._");
+            whatsAppClient.sendTextMessage(doctorPhone, sb.toString().trim());
         }
     }
 
