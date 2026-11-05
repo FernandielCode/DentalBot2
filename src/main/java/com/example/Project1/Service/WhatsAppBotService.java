@@ -177,6 +177,7 @@ public class WhatsAppBotService {
 
             patient.setPatientName(parsedInfo.name);
             patient.setPatientAge(parsedInfo.age);
+            patient.setPatientState(PatientState.ON_TRACKING);
             patient = patientRepository.save(patient);
 
             contact.setPatientContact(patient);
@@ -193,7 +194,11 @@ public class WhatsAppBotService {
             appointment.setNotes("Suggested: " + suggestedAppointment);
             appointment.setCreatedAt(new Timestamp(System.currentTimeMillis()));
             appointment.setStartAppointmentAt(Timestamp.valueOf(LocalDate.now().plusDays(1).atTime(10, 0)));
-            appointment.setPatientState(PatientState.UNDEFINED);
+
+            if(appointment.getPaymentMethod() == null) {
+                patient.setPatientPaymentState(PatientPaymentState.UNDEFINED_PRICE);
+                appointment.setPatientState(PatientState.UNDEFINED);
+                }
 
             // Assign default active dentist if configured
             Optional<Dentist> activeDentist = dentistRepository.findFirstByIsDentistActiveTrue();
@@ -202,13 +207,13 @@ public class WhatsAppBotService {
             appointmentRepository.save(appointment);
 
             // Acknowledge receipt to the Patient
-            String patientAck = "Thank you, " + parsedInfo.name + "! We have received your information and notified the Doctor to confirm your appointment time.";
+            String patientAck = "Gracias, " + parsedInfo.name + "! Hemos recibido tu información y notificado al Doctor para que confirme tu cita.";
             whatsAppClient.sendTextMessage(fromPhone, patientAck);
             saveMessageRecord(contact, null, "OUTGOING", patientAck);
 
             // Forward notification to the Doctor
-            String doctorMessage = "The patient " + parsedInfo.name + " with age " + parsedInfo.age
-                    + ", When would you like to schedule the appointment of this patient?, here are some suggested appointments: "
+            String doctorMessage = "El paciente " + parsedInfo.name + " con edad " + parsedInfo.age
+                    + ", Cuando desearía recibir a este paciente?, aquí hay algunas sugerencias: "
                     + suggestedAppointment;
 
             String recipientDoctor = (doctorPhone != null && !doctorPhone.isBlank()) ? doctorPhone : fromPhone;
@@ -269,7 +274,7 @@ public class WhatsAppBotService {
         if (selectedTreatmentId != null) {
             log.info("Doctor selected treatment option: id={}, title={}", selectedTreatmentId, messageBody);
             String confirmationText = "Tratamiento registrado con éxito: *" + messageBody + "*.\n"
-                    + "El pago del paciente es de: $"+treatmentsRepository.findPriceByTreatmentId(selectedTreatmentId);
+                    + "El pago del paciente es de: $"+treatmentsRepository.findPriceByTreatment(selectedTreatmentId);
             whatsAppClient.sendTextMessage(doctorPhone, confirmationText);
 
             // Command 5: Bot asks the doctor what method of payment did the patient selected, and if the patient paid the full price or partially

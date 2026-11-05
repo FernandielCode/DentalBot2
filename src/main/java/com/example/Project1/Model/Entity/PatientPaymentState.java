@@ -4,8 +4,8 @@ public enum PatientPaymentState {
     /// PAYMENT STATUS ///
     COMPLETE("COMPLETO"),
     PARTIALLY("PARCIALMENTE"),
-    IN_DEBT("EN DEUDA");
-
+    IN_DEBT("EN DEUDA"),
+    UNDEFINED_PRICE("POR DEFINIR");
     private final String patientPaymentState;
 
     PatientPaymentState(String patientPaymentState) {

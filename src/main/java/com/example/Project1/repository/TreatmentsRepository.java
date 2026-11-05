@@ -15,6 +15,6 @@ public interface TreatmentsRepository extends JpaRepository<Treatments, Long> {
     @Query(value = "SELECT Treatments.treatments FROM Treatments", nativeQuery = true)
     List<SendInteractiveListRequest.Row> getAllTreatmentsIgnoreCase();
 
-    Long findPriceByTreatmentId(String treatment);
+    Long findPriceByTreatment(String treatment);
 
 }

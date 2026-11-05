@@ -48,7 +48,7 @@ public class Appointment {
     @Column(nullable = false)
     private Timestamp createdAt;
 
-    @Column(nullable = false)
+    @Column(nullable = true)
     @Enumerated(EnumType.STRING)
     private PaymentMethod paymentMethod;
 

@@ -13,6 +13,7 @@ public class Treatments {
     @Column(name = "treatments",nullable = false)
     private String treatment;
 
+    @Column(nullable = false)
     private long price;
 
     // Default no-args constructor required by JPA

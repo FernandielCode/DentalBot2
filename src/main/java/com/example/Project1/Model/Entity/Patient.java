@@ -34,12 +34,16 @@ public class Patient {
     @Column(name = "patient_state", nullable = false)
     private PatientState patientState;
 
+    @Column
+    @Enumerated(EnumType.STRING)
+    private PatientPaymentState patientPaymentState;
+
     public Patient() {
     }
 
     public Patient(UUID patientUUID, int patientNumber, String patientName,
                    String patientLastname, String patientPhone, Integer patientAge,
-                   PatientState patientState) {
+                   PatientState patientState, PatientPaymentState patientPaymentState) {
         this.patientUUID = patientUUID;
         this.patientNumber = patientNumber;
         this.patientName = patientName;
@@ -47,6 +51,7 @@ public class Patient {
         this.patientPhone = patientPhone;
         this.patientAge = patientAge;
         this.patientState = patientState;
+        this.patientPaymentState = patientPaymentState;
     }
 
     public UUID getPatientUUID() {
@@ -127,5 +132,13 @@ public class Patient {
 
     public void setPatientState(PatientState patientState) {
         this.patientState = patientState;
+    }
+
+    public PatientPaymentState getPatientPaymentState() {
+        return patientPaymentState;
+    }
+
+    public void setPatientPaymentState(PatientPaymentState patientPaymentState) {
+        this.patientPaymentState = patientPaymentState;
     }
 }
