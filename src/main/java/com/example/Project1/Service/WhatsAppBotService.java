@@ -6,18 +6,24 @@ import com.example.Project1.Model.DTO.WhatsAppWebhookPayload;
 import com.example.Project1.Model.Entity.*;
 import com.example.Project1.repository.*;
 import jakarta.transaction.Transactional;
+import org.hibernate.type.descriptor.java.LocalDateJavaType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.jpa.convert.threeten.Jsr310JpaConverters;
 import org.springframework.stereotype.Service;
 
+import java.sql.Time;
 import java.sql.Timestamp;
+import java.text.BreakIterator;
 import java.text.SimpleDateFormat;
-import java.time.DayOfWeek;
-import java.time.LocalDate;
+import java.time.*;
 import java.time.format.DateTimeFormatter;
+import java.time.format.FormatStyle;
+import java.time.temporal.ChronoField;
+import java.time.temporal.TemporalAccessor;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
@@ -90,7 +96,7 @@ public class WhatsAppBotService {
      * is the Doctor (admin commands) or a Patient (appointment scheduling).
      */
     private void handleIncomingMessage(WhatsAppWebhookPayload.IncomingMessage incomingMessage,
-                                        List<WhatsAppWebhookPayload.Contact> contacts) {
+                                       List<WhatsAppWebhookPayload.Contact> contacts) {
         String fromPhone = incomingMessage.from();
         // Support both regular text and interactive button/list selections
         String messageBody = incomingMessage.getExtractedText();
@@ -195,15 +201,14 @@ public class WhatsAppBotService {
             appointment.setCreatedAt(new Timestamp(System.currentTimeMillis()));
             appointment.setStartAppointmentAt(Timestamp.valueOf(LocalDate.now().plusDays(1).atTime(10, 0)));
 
-            if(appointment.getPaymentMethod() == null) {
+            if (appointment.getPaymentMethod() == null) {
                 patient.setPatientPaymentState(PatientPaymentState.UNDEFINED_PRICE);
                 appointment.setPatientState(PatientState.UNDEFINED);
-                }
+            }
 
             // Assign default active dentist if configured
             Optional<Dentist> activeDentist = dentistRepository.findFirstByIsDentistActiveTrue();
             activeDentist.ifPresent(appointment::setDentistAppointment);
-
             appointmentRepository.save(appointment);
 
             // Acknowledge receipt to the Patient
@@ -213,8 +218,9 @@ public class WhatsAppBotService {
 
             // Forward notification to the Doctor
             String doctorMessage = "El paciente " + parsedInfo.name + " con edad " + parsedInfo.age
-                    + ", Cuando desearía recibir a este paciente?, aquí hay algunas sugerencias: "
-                    + suggestedAppointment;
+                    + ", Cuando desearía recibir a este paciente?, aquí hay algunas sugerencias: \n"
+                    + suggestedAppointment + ". Si desea, puede poner la fecha ud mismo de la siguiente manera \n"
+                    + "*<día> de <mes> <hora> (Ejemplo: 20 de noviembre de 2026)*";
 
             String recipientDoctor = (doctorPhone != null && !doctorPhone.isBlank()) ? doctorPhone : fromPhone;
             whatsAppClient.sendTextMessage(recipientDoctor, doctorMessage);
@@ -229,9 +235,9 @@ public class WhatsAppBotService {
     /**
      * Handles administrative commands and interactive menu responses sent by the Doctor.
      *
-     * @param doctorPhone The verified phone number of the doctor
+     * @param doctorPhone     The verified phone number of the doctor
      * @param incomingMessage The incoming webhook message payload
-     * @param messageBody Text content of the message or selected menu option
+     * @param messageBody     Text content of the message or selected menu option
      * @return true if the message was handled as a doctor command, false to allow default flow
      */
     private boolean handleDoctorMessage(String doctorPhone,
@@ -274,7 +280,7 @@ public class WhatsAppBotService {
         if (selectedTreatmentId != null) {
             log.info("Doctor selected treatment option: id={}, title={}", selectedTreatmentId, messageBody);
             String confirmationText = "Tratamiento registrado con éxito: *" + messageBody + "*.\n"
-                    + "El pago del paciente es de: $"+treatmentsRepository.findPriceByTreatment(selectedTreatmentId);
+                    + "El pago del paciente es de: $" + treatmentsRepository.findPriceByTreatment(selectedTreatmentId);
             whatsAppClient.sendTextMessage(doctorPhone, confirmationText);
 
             // Command 5: Bot asks the doctor what method of payment did the patient selected, and if the patient paid the full price or partially
@@ -282,14 +288,14 @@ public class WhatsAppBotService {
             String promptForPayment = "De qué forma realizó el pago el paciente?: \n";
             String buttonTextPayment = "Ver métodos de pago";
             String selectedPaymentMethodId = incomingMessage.getInteractiveSelectionId();
-            List<SendInteractiveListRequest.Row> paymentMethods =List.of(
-                    new SendInteractiveListRequest.Row("PAY_TRANSFERENCIA","TRANSFERENCIA", "Por Banca móvil de cualquier banco"),
-                    new SendInteractiveListRequest.Row("PAY_EFECTIVO","EFECTIVO","Billetes/monedas")
+            List<SendInteractiveListRequest.Row> paymentMethods = List.of(
+                    new SendInteractiveListRequest.Row("PAY_TRANSFERENCIA", "TRANSFERENCIA", "Por Banca móvil de cualquier banco"),
+                    new SendInteractiveListRequest.Row("PAY_EFECTIVO", "EFECTIVO", "Billetes/monedas")
             );
-            whatsAppClient.sendInteractiveList(doctorPhone,promptForPayment,buttonTextPayment,paymentMethods);
-            if (selectedPaymentMethodId.equals("PAY_TRANSFERENCIA")){
-                String promptConfirmCompletePayment= "El Paciente ha pagado todo, parcialmente, o queda debiéndole?";
-                whatsAppClient.sendTextMessage(doctorPhone,promptConfirmCompletePayment);
+            whatsAppClient.sendInteractiveList(doctorPhone, promptForPayment, buttonTextPayment, paymentMethods);
+            if (selectedPaymentMethodId.equals("PAY_TRANSFERENCIA")) {
+                String promptConfirmCompletePayment = "El Paciente ha pagado todo, parcialmente, o queda debiéndole?";
+                whatsAppClient.sendTextMessage(doctorPhone, promptConfirmCompletePayment);
             }
             return true;
         }
@@ -300,7 +306,7 @@ public class WhatsAppBotService {
      * Renders up to 10 appointments per page with formatted details and a "Ver más citas" pagination button.
      *
      * @param doctorPhone Recipient phone number of the doctor
-     * @param pageNumber Zero-based page index (0 = first 10, 1 = next 10, etc.)
+     * @param pageNumber  Zero-based page index (0 = first 10, 1 = next 10, etc.)
      */
     private void showAppointmentsPage(String doctorPhone, int pageNumber) {
         int pageSize = 10;
@@ -345,12 +351,12 @@ public class WhatsAppBotService {
                     : "Por definir";
 
             sb.append(index).append(". ")
-              .append("Paciente: ").append(patientName).append(". ")
-              .append("Tratamiento: ").append(treatments).append(". ")
-              .append("última/próxima fecha: ").append(date).append(". ")
-              .append("Hora: ").append(time).append(". ")
-              .append("Estado: ").append(state).append(". ")
-              .append("Método de pago: ").append(payment).append(".\n\n");
+                    .append("Paciente: ").append(patientName).append(". ")
+                    .append("Tratamiento: ").append(treatments).append(". ")
+                    .append("última/próxima fecha: ").append(date).append(". ")
+                    .append("Hora: ").append(time).append(". ")
+                    .append("Estado: ").append(state).append(". ")
+                    .append("Método de pago: ").append(payment).append(".\n\n");
 
             index++;
         }
@@ -386,7 +392,7 @@ public class WhatsAppBotService {
         if (date.getDayOfWeek() == DayOfWeek.SUNDAY) {
             date = date.plusDays(1);
         }
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("EEEE, MMM d 'at' 10:00 AM", Locale.ENGLISH);
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("EEEE, MMM d 'a las' 10:00 AM", Locale.ENGLISH);
         return date.atTime(10, 0).format(formatter);
     }
 
@@ -428,5 +434,205 @@ public class WhatsAppBotService {
         return null;
     }
 
+    // ===================================================================================
+    // DOCTOR CUSTOM DATE PARSING UTILITIES
+    // ===================================================================================
+
+    /**
+     * Fast, thread-safe dictionary mapping Spanish month names and standard abbreviations
+     * to Java's {@link Month} enum.
+     */
+    private static final java.util.Map<String, Month> SPANISH_MONTHS = java.util.Map.ofEntries(
+            java.util.Map.entry("enero", Month.JANUARY),
+            java.util.Map.entry("ene", Month.JANUARY),
+            java.util.Map.entry("febrero", Month.FEBRUARY),
+            java.util.Map.entry("feb", Month.FEBRUARY),
+            java.util.Map.entry("marzo", Month.MARCH),
+            java.util.Map.entry("mar", Month.MARCH),
+            java.util.Map.entry("abril", Month.APRIL),
+            java.util.Map.entry("abr", Month.APRIL),
+            java.util.Map.entry("mayo", Month.MAY),
+            java.util.Map.entry("may", Month.MAY),
+            java.util.Map.entry("junio", Month.JUNE),
+            java.util.Map.entry("jun", Month.JUNE),
+            java.util.Map.entry("julio", Month.JULY),
+            java.util.Map.entry("jul", Month.JULY),
+            java.util.Map.entry("agosto", Month.AUGUST),
+            java.util.Map.entry("ago", Month.AUGUST),
+            java.util.Map.entry("septiembre", Month.SEPTEMBER),
+            java.util.Map.entry("setiembre", Month.SEPTEMBER),
+            java.util.Map.entry("sep", Month.SEPTEMBER),
+            java.util.Map.entry("octubre", Month.OCTOBER),
+            java.util.Map.entry("oct", Month.OCTOBER),
+            java.util.Map.entry("noviembre", Month.NOVEMBER),
+            java.util.Map.entry("nov", Month.NOVEMBER),
+            java.util.Map.entry("diciembre", Month.DECEMBER),
+            java.util.Map.entry("dic", Month.DECEMBER)
+    );
+
+    /**
+     * Identifies and returns the Spanish {@link Month} from a given word, ignoring punctuation and casing.
+     *
+     * @param word Single word or token (e.g. "noviembre", "nov", "noviembre,")
+     * @return {@link Month} if matched, or {@code null} if not a month
+     */
+    private Month findMonth(String word) {
+        if (word == null || word.isBlank()) {
+            return null;
+        }
+        // Remove common punctuation attached to words like commas, periods, etc.
+        String clean = word.toLowerCase().trim().replaceAll("[^a-záéíóúñ]", "");
+        return SPANISH_MONTHS.get(clean);
+    }
+
+    /**
+     * Extracts a time (hour & minute) from the doctor's message text.
+     * Supports:
+     *   - 12-hour format with AM/PM (e.g., "10am", "10:30am", "3pm", "3:15 pm")
+     *   - 24-hour format (e.g., "15:00", "09:30", "18:45")
+     *
+     * @param text The full message string
+     * @return Parsed {@link LocalTime}, or {@code null} if no explicit time was found in the text
+     */
+    private LocalTime findTime(String text) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+
+        // 1. Check for 12-hour format with am/pm (e.g. "10am", "10:30am", "3pm", "3:15 pm")
+        Pattern ampmPattern = Pattern.compile("\\b(1[0-2]|0?[1-9])(?::([0-5][0-9]))?\\s*(am|pm)\\b", Pattern.CASE_INSENSITIVE);
+        Matcher ampmMatcher = ampmPattern.matcher(text);
+        if (ampmMatcher.find()) {
+            int hour = Integer.parseInt(ampmMatcher.group(1));
+            int minute = ampmMatcher.group(2) != null ? Integer.parseInt(ampmMatcher.group(2)) : 0;
+            String ampm = ampmMatcher.group(3).toLowerCase();
+
+            if ("pm".equals(ampm) && hour < 12) {
+                hour += 12;
+            } else if ("am".equals(ampm) && hour == 12) {
+                hour = 0;
+            }
+            return LocalTime.of(hour, minute);
+        }
+
+        // 2. Check for 24-hour format with colon (e.g. "15:00", "09:30")
+        Pattern h24Pattern = Pattern.compile("\\b([01]?[0-9]|2[0-3]):([0-5][0-9])\\b");
+        Matcher h24Matcher = h24Pattern.matcher(text);
+        if (h24Matcher.find()) {
+            int hour = Integer.parseInt(h24Matcher.group(1));
+            int minute = Integer.parseInt(h24Matcher.group(2));
+            return LocalTime.of(hour, minute);
+        }
+
+        return null;
+    }
+
+    /**
+     * Extracts a numeric day from a text string or single token.
+     *
+     * @param text String that may contain a day number
+     * @return Day of month (1-31), or 0 if no valid day is found
+     */
+    public Integer extractDay(String text) {
+        if (text == null || text.isBlank()) {
+            return 0;
+        }
+        Matcher matcher = Pattern.compile("\\b([1-9]|[12][0-9]|3[01])\\b").matcher(text);
+        if (matcher.find()) {
+            return Integer.parseInt(matcher.group(1));
+        }
+        return 0;
+    }
+
+    /**
+     * Parses the doctor's custom date and time proposal from a natural text message.
+     *
+     * Supported formats:
+     *   1. Natural Spanish:
+     *      - "Me gustaría dejarle para el 5 de noviembre del 2026 a las 10:00"
+     *      - "5 de noviembre a las 3pm"
+     *      - "el 12 de diciembre" (defaults time to 10:00 AM)
+     *   2. Standard Numeric (Latin America):
+     *      - "24/11/2026 10:00"
+     *      - "24-11-2026 15:30"
+     *      - "24/11 a las 4pm" (defaults year to current year)
+     *
+     * @param messageDoctor Text message sent by the doctor
+     * @return A valid {@link LocalDateTime} representing the scheduled appointment,
+     *         or {@code null} if a date could not be determined.
+     */
+    private LocalDateTime parsedDoctorCustomizedDate(String messageDoctor) {
+        if (messageDoctor == null || messageDoctor.isBlank()) {
+            log.warn("Doctor message is null or blank for custom date parsing.");
+            return null;
+        }
+
+        String input = messageDoctor.trim();
+
+        // -----------------------------------------------------------------------------------
+        // STEP 1: EXTRACT TIME (or default to 10:00 AM standard appointment hour)
+        // -----------------------------------------------------------------------------------
+        LocalTime timeFound = findTime(input);
+        if (timeFound == null) {
+            // Default clinic appointment time if doctor didn't specify an hour
+            timeFound = LocalTime.of(10, 0);
+        }
+
+        // -----------------------------------------------------------------------------------
+        // STEP 2: EXTRACT DATE (Numeric format or Spanish written format)
+        // -----------------------------------------------------------------------------------
+        int day = 0;
+        int monthValue = 0;
+        int year = LocalDate.now().getYear(); // Default to current year if omitted
+
+        // Pattern A: Numeric date dd/MM/yyyy or dd-MM-yyyy or dd/MM (e.g., "24/11/2026", "24/11")
+        Pattern numericDatePattern = Pattern.compile("\\b(\\d{1,2})[/\\-](\\d{1,2})(?:[/\\-](\\d{4}))?\\b");
+        Matcher numericMatcher = numericDatePattern.matcher(input);
+
+        if (numericMatcher.find()) {
+            day = Integer.parseInt(numericMatcher.group(1));
+            monthValue = Integer.parseInt(numericMatcher.group(2));
+            if (numericMatcher.group(3) != null) {
+                year = Integer.parseInt(numericMatcher.group(3));
+            }
+        } else {
+            // Pattern B: Written Spanish date: e.g. "5 de noviembre del 2026", "el 12 nov 2026", "5 de noviembre"
+            Pattern writtenDatePattern = Pattern.compile(
+                    "\\b(\\d{1,2})\\s*(?:de)?\\s*([a-zA-ZáéíóúÁÉÍÓÚñÑ]+)(?:\\s*(?:del?|de)?\\s*(\\d{4}))?\\b",
+                    Pattern.CASE_INSENSITIVE
+            );
+            Matcher writtenMatcher = writtenDatePattern.matcher(input);
+
+            if (writtenMatcher.find()) {
+                day = Integer.parseInt(writtenMatcher.group(1));
+                String monthWord = writtenMatcher.group(2);
+                Month month = findMonth(monthWord);
+                if (month != null) {
+                    monthValue = month.getValue();
+                }
+                if (writtenMatcher.group(3) != null) {
+                    year = Integer.parseInt(writtenMatcher.group(3));
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------------------
+        // STEP 3: VALIDATE AND BUILD LOCALDATETIME
+        // -----------------------------------------------------------------------------------
+        if (day < 1 || day > 31 || monthValue < 1 || monthValue > 12) {
+            log.warn("Could not extract a valid date from doctor's message: '{}'", messageDoctor);
+            return null;
+        }
+
+        try {
+            LocalDate date = LocalDate.of(year, monthValue, day);
+            LocalDateTime scheduledDateTime = LocalDateTime.of(date, timeFound);
+            log.info("Successfully parsed customized doctor appointment: {}", scheduledDateTime);
+            return scheduledDateTime;
+        } catch (DateTimeException e) {
+            log.error("Invalid calendar date constructed from doctor message '{}': {}", messageDoctor, e.getMessage());
+            return null;
+        }
+    }
     private record ParsedPatientInfo(String name, Integer age) {}
 }

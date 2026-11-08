@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 
 import java.sql.Timestamp;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -52,6 +53,9 @@ public class Appointment {
     @Enumerated(EnumType.STRING)
     private PaymentMethod paymentMethod;
 
+    @Column
+    private LocalDateTime appointmentDateTime;
+
     @JsonIgnore
     @OneToMany(mappedBy = "notificationAppointment")
     private List<Notification> appointmentNotificationList;
@@ -62,7 +66,7 @@ public class Appointment {
     public Appointment(UUID appointmentId, Patient patientAppointment, Dentist dentistAppointment,
                        List<Treatments> treatments, Timestamp startAppointmentAt, String category,
                        String appointmentStatus, PatientState patientState, String notes, Timestamp createdAt,
-                       PaymentMethod paymentMethod) {
+                       LocalDateTime appointmentDateTime ,PaymentMethod paymentMethod) {
         this.appointmentId = appointmentId;
         this.patientAppointment = patientAppointment;
         this.dentistAppointment = dentistAppointment;
@@ -73,6 +77,7 @@ public class Appointment {
         this.appointmentStatus = appointmentStatus;
         this.notes = notes;
         this.createdAt = createdAt;
+        this.appointmentDateTime = appointmentDateTime;
         this.paymentMethod = paymentMethod;
     }
 
@@ -162,6 +167,14 @@ public class Appointment {
 
     public void setAppointmentNotificationList(List<Notification> appointmentNotificationList) {
         this.appointmentNotificationList = appointmentNotificationList;
+    }
+
+    public LocalDateTime getAppointmentDateTime() {
+        return appointmentDateTime;
+    }
+
+    public void setAppointmentDateTime(LocalDateTime appointmentDateTime) {
+        this.appointmentDateTime = appointmentDateTime;
     }
 
     public PaymentMethod getPaymentMethod() {
