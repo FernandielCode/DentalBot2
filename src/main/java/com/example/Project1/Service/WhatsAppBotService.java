@@ -49,6 +49,7 @@ public class WhatsAppBotService {
     private final AppointmentRepository appointmentRepository;
     private final DentistRepository dentistRepository;
 
+    private boolean isWaitingDate = false;
     public WhatsAppBotService(WhatsAppClient whatsAppClient,
                               WhatsAppProperties properties,
                               WhatsAppContactRepository contactRepository,
@@ -221,7 +222,7 @@ public class WhatsAppBotService {
                     + ", Cuando desearía recibir a este paciente?, aquí hay algunas sugerencias: \n"
                     + suggestedAppointment + ". Si desea, puede poner la fecha ud mismo de la siguiente manera \n"
                     + "*<día> de <mes> <hora> (Ejemplo: 20 de noviembre de 2026)*";
-
+            isWaitingDate = true;
             String recipientDoctor = (doctorPhone != null && !doctorPhone.isBlank()) ? doctorPhone : fromPhone;
             whatsAppClient.sendTextMessage(recipientDoctor, doctorMessage);
             log.info("Forwarded patient details to Doctor ({})", recipientDoctor);
@@ -245,6 +246,49 @@ public class WhatsAppBotService {
                                         String messageBody) {
 
         String selectedOptionId = incomingMessage.getInteractiveSelectionId();
+
+        // If the bot is awaiting a custom date from the Doctor for a pending appointment
+        if (isWaitingDate && selectedOptionId == null && !"citas".equalsIgnoreCase(messageBody.trim()) && !"pago".equalsIgnoreCase(messageBody.trim())) {
+            LocalDateTime customDate = parsedDoctorCustomizedDate(messageBody);
+
+            if (customDate != null) {
+                // Find the most recent pending appointment
+                Optional<Appointment> latestPendingAppt = appointmentRepository.findTopByAppointmentStatusOrderByCreatedAtDesc("PENDING");
+
+                if (latestPendingAppt.isPresent()) {
+                    Appointment appointment = latestPendingAppt.get();
+                    appointment.setStartAppointmentAt(Timestamp.valueOf(customDate));
+                    appointment.setAppointmentStatus("CONFIRMED");
+                    appointmentRepository.save(appointment);
+
+                    // Reset waiting flag
+                    isWaitingDate = false;
+
+                    // Confirm to Doctor
+                    DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd/MM/yyyy 'a las' hh:mma", Locale.of("es", "ES"));
+                    String formattedDate = customDate.format(formatter);
+                    String confirmationDoctor = "✅ Cita confirmada con éxito para el *" + formattedDate + "*.";
+                    whatsAppClient.sendTextMessage(doctorPhone, confirmationDoctor);
+
+                    // Notify the patient if phone is available
+                    if (appointment.getPatientAppointment() != null && appointment.getPatientAppointment().getPatientPhone() != null) {
+                        String patientPhone = appointment.getPatientAppointment().getPatientPhone();
+                        String confirmationPatient = "¡Hola! El doctor ha confirmado tu cita para el *"
+                                + formattedDate + "*. Te esperamos en la clínica.";
+                        whatsAppClient.sendTextMessage(patientPhone, confirmationPatient);
+                    }
+                    return true;
+                } else {
+                    log.warn("isWaitingDate is true, but no PENDING appointment was found in DB.");
+                    isWaitingDate = false;
+                }
+            } else {
+                // Doctor typed something that couldn't be parsed as a date
+                String retryMsg = "No logré reconocer la fecha. Por favor indíquela como: *día de mes hora* (Ejemplo: *24 de noviembre 10:00am*) o envíe *citas* para ver el listado.";
+                whatsAppClient.sendTextMessage(doctorPhone, retryMsg);
+                return true;
+            }
+        }
 
         // Command 1: Doctor types "citas" -> Display Page 0 (most recent 10 appointments)
         if ("citas".equalsIgnoreCase(messageBody.trim())) {
