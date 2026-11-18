@@ -1,6 +1,7 @@
 package com.example.Project1.Service;
 
 import com.example.Project1.Config.WhatsAppProperties;
+import com.example.Project1.Model.DTO.SendFlowRequest;
 import com.example.Project1.Model.DTO.SendInteractiveButtonRequest;
 import com.example.Project1.Model.DTO.SendInteractiveListRequest;
 import com.example.Project1.Model.DTO.SendMessageRequest;
@@ -10,6 +11,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * Service client responsible for dispatching HTTP requests to Meta's WhatsApp Cloud API.
@@ -106,6 +108,7 @@ public class WhatsAppClient {
      * @param buttonId Unique action identifier (e.g., "CITAS_PAGE_1")
      * @return true if successfully sent to Meta, false otherwise
      */
+
     public boolean sendInteractiveButton(String to, String bodyText, String buttonText, String buttonId) {
         if (properties.getPhoneNumberId() == null || properties.getPhoneNumberId().isBlank()
                 || properties.getAccessToken() == null || properties.getAccessToken().isBlank()) {
@@ -128,6 +131,74 @@ public class WhatsAppClient {
             return true;
         } catch (Exception e) {
             log.error("Failed to send WhatsApp interactive button to {}: {}", to, e.getMessage(), e);
+            return false;
+        }
+    }
+    public boolean sendInteractiveButtons(String to, String bodyText, List<SendInteractiveButtonRequest.Button> buttons) {
+        if (properties.getPhoneNumberId() == null || properties.getPhoneNumberId().isBlank()
+                || properties.getAccessToken() == null || properties.getAccessToken().isBlank()) {
+            log.warn("[LOCAL DEV SIMULATION] Buttons to {}: {}", to, bodyText);
+            return true;
+        }
+
+        try {
+            SendInteractiveButtonRequest request = SendInteractiveButtonRequest.createMultipleButtons(to, bodyText, buttons);
+            String uri = "/" + properties.getPhoneNumberId() + "/messages";
+
+            String response = restClient.post()
+                    .uri(uri)
+                    .header("Authorization", "Bearer " + properties.getAccessToken())
+                    .body(request)
+                    .retrieve()
+                    .body(String.class);
+
+            log.info("Sent WhatsApp interactive buttons to {}. Response: {}", to, response);
+            return true;
+        } catch (Exception e) {
+            log.error("Failed to send WhatsApp interactive buttons to {}: {}", to, e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * Sends an interactive WhatsApp Flow message (form).
+     *
+     * @param to        Destination phone number with country code
+     * @param flowId    Published Flow ID provided by WhatsApp
+     * @param flowToken Unique token used to correlate the response in the webhook
+     * @param cta       Text of the call-to-action button (max ~30 characters)
+     * @param header    Optional header text
+     * @param body      Message body displayed above the CTA
+     * @param footer    Optional footer text
+     * @param screen    Entry screen id defined in the Flow JSON
+     * @param data      Optional initial data for the entry screen
+     * @return true if successfully delivered to Meta, false otherwise
+     */
+    public boolean sendFlow(String to, String flowId, String flowToken,
+                            String cta, String header, String body, String footer,
+                            String screen, Map<String, Object> data) {
+        if (properties.getPhoneNumberId() == null || properties.getPhoneNumberId().isBlank()
+                || properties.getAccessToken() == null || properties.getAccessToken().isBlank()) {
+            log.warn("[LOCAL DEV SIMULATION] Flow to {}: flowId={}, token={}", to, flowId, flowToken);
+            return true;
+        }
+
+        try {
+            SendFlowRequest request = SendFlowRequest.create(
+                    to, flowId, flowToken, cta, header, body, footer, screen, data);
+            String uri = "/" + properties.getPhoneNumberId() + "/messages";
+
+            String response = restClient.post()
+                    .uri(uri)
+                    .header("Authorization", "Bearer " + properties.getAccessToken())
+                    .body(request)
+                    .retrieve()
+                    .body(String.class);
+
+            log.info("Sent WhatsApp flow to {}. Response: {}", to, response);
+            return true;
+        } catch (Exception e) {
+            log.error("Failed to send WhatsApp flow to {}: {}", to, e.getMessage(), e);
             return false;
         }
     }

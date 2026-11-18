@@ -49,6 +49,23 @@ public record SendInteractiveButtonRequest(
                 )
         );
     }
+    public static SendInteractiveButtonRequest createMultipleButtons(
+            String to,
+            String bodyText,
+            List<Button> buttons
+    ) {
+        return new SendInteractiveButtonRequest(
+                "whatsapp",
+                "individual",
+                to,
+                "interactive",
+                new Interactive(
+                        "button",
+                        new Body(bodyText),
+                        new Action(buttons)
+                )
+        );
+    }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Interactive(

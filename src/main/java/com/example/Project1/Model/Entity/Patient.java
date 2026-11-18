@@ -3,6 +3,7 @@ package com.example.Project1.Model.Entity;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -38,12 +39,16 @@ public class Patient {
     @Enumerated(EnumType.STRING)
     private PatientPaymentState patientPaymentState;
 
+    @Column
+    private LocalDateTime appointment;
+
     public Patient() {
     }
 
     public Patient(UUID patientUUID, int patientNumber, String patientName,
                    String patientLastname, String patientPhone, Integer patientAge,
-                   PatientState patientState, PatientPaymentState patientPaymentState) {
+                   PatientState patientState, PatientPaymentState patientPaymentState,
+                   LocalDateTime appointment) {
         this.patientUUID = patientUUID;
         this.patientNumber = patientNumber;
         this.patientName = patientName;
@@ -52,6 +57,7 @@ public class Patient {
         this.patientAge = patientAge;
         this.patientState = patientState;
         this.patientPaymentState = patientPaymentState;
+        this.appointment = appointment;
     }
 
     public UUID getPatientUUID() {
@@ -140,5 +146,13 @@ public class Patient {
 
     public void setPatientPaymentState(PatientPaymentState patientPaymentState) {
         this.patientPaymentState = patientPaymentState;
+    }
+
+    public LocalDateTime getAppointment() {
+        return appointment;
+    }
+
+    public void setAppointment(LocalDateTime appointment) {
+        this.appointment = appointment;
     }
 }

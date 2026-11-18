@@ -26,7 +26,9 @@ public class WhatsAppSession {
     @OneToMany(mappedBy = "whatsAppSession")
     private List<BotCommand> botCommandList;
 
-    private String currentState;
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private SessionState currentState;
     @Column(columnDefinition = "TEXT")
     private String contextJSON;
     private Timestamp expiresAt;
@@ -36,7 +38,7 @@ public class WhatsAppSession {
     }
 
     public WhatsAppSession(UUID sessionId, WhatsAppContact whatsAppContact, MessageThread messageThread,
-                           String currentState, String contextJSON, Timestamp expiresAt, Timestamp updatedAt) {
+                           SessionState currentState, String contextJSON, Timestamp expiresAt, Timestamp updatedAt) {
         this.sessionId = sessionId;
         this.whatsAppContact = whatsAppContact;
         this.messageThread = messageThread;
@@ -78,11 +80,11 @@ public class WhatsAppSession {
         this.botCommandList = botCommandList;
     }
 
-    public String getCurrentState() {
+    public SessionState getCurrentState() {
         return currentState;
     }
 
-    public void setCurrentState(String currentState) {
+    public void setCurrentState(SessionState currentState) {
         this.currentState = currentState;
     }
 
