@@ -11,19 +11,26 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
-import tools.jackson.core.type.TypeReference;
-import tools.jackson.databind.ObjectMapper;
+
 import java.sql.Timestamp;
+import java.text.Normalizer;
 import java.text.SimpleDateFormat;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -36,6 +43,65 @@ import java.util.stream.Collectors;
 public class WhatsAppBotService {
     private static final Logger log = LoggerFactory.getLogger(WhatsAppBotService.class);
 
+    private static final String MENU_BUTTON = "Ver Opciones";
+    private static final String MENU_SEARCH = "DOC_MENU_SEARCH";
+    private static final String MENU_UPDATE = "DOC_MENU_UPDATE";
+    private static final String MENU_PAY = "DOC_MENU_PAY";
+    private static final String MENU_PATIENTS = "DOC_MENU_PATIENTS";
+    private static final String MENU_REGISTER = "DOC_MENU_REGISTER";
+
+    private static final String TARGET_PATIENT = "UPD_TARGET_PATIENT";
+    private static final String TARGET_CITA = "UPD_TARGET_CITA";
+
+    private static final String PATIENT_PREFIX = "UPD_PAT_";
+    private static final String APPOINTMENT_PREFIX = "UPD_APPT_";
+    private static final String FIELD_PREFIX = "UPD_FIELD_";
+    private static final String CONFIRM_YES = "UPD_CONFIRM_YES";
+    private static final String CONFIRM_NO = "UPD_CONFIRM_NO";
+    private static final String PATIENTS_PAGE_PREFIX = "PATIENTS_PAGE_";
+
+    private static final String SEARCH_PROMPT =
+            "Ingrese el nombre, apellido, fecha o tratamiento del paciente que desea buscar";
+    private static final String NOT_FOUND_MESSAGE = "El paciente que busca no está registrado";
+    private static final String UPDATED_MESSAGE = "LOS DATOS HAN SIDO ACTUALIZADOS!";
+
+    private static final List<String> PATIENT_REGISTRATION_FIELDS = List.of(
+            "patientName", "patientLastname", "patientPhone", "patientAge",
+            "patientState", "patientPaymentState");
+
+    private final Map<String, DoctorSession> doctorSessions = new ConcurrentHashMap<>();
+
+    private enum DoctorState {
+        IDLE,
+        AWAITING_SEARCH_QUERY,
+        UPDATE_AWAITING_TARGET,
+        UPDATE_AWAITING_PATIENT_SELECTION,
+        UPDATE_AWAITING_APPOINTMENT_SELECTION,
+        UPDATE_AWAITING_FIELD_SELECTION,
+        UPDATE_AWAITING_NEW_VALUE,
+        UPDATE_AWAITING_CONFIRM,
+        REGISTER_AWAITING_FIELD
+    }
+
+    private enum UpdateTarget { PATIENT, CITA }
+
+    private static final class DoctorSession {
+        DoctorState state = DoctorState.IDLE;
+        boolean updateMode;
+        UpdateTarget updateTarget;
+        List<UUID> patientCandidates = new ArrayList<>();
+        UUID selectedPatientId;
+        List<UUID> appointmentCandidates = new ArrayList<>();
+        UUID selectedAppointmentId;
+        String selectedField;
+        Map<String, Object> pendingChanges = new LinkedHashMap<>();
+        UUID registeringPatientId;
+        int registerFieldIndex;
+    }
+
+    private record SearchOutcome(List<Patient> patients,
+                                 Map<UUID, List<Appointment>> appointmentsByPatient) {}
+
     private final WhatsAppClient whatsAppClient;
     private final WhatsAppProperties properties;
     private final WhatsAppContactRepository contactRepository;
@@ -45,20 +111,8 @@ public class WhatsAppBotService {
     private final PatientRepository patientRepository;
     private final AppointmentRepository appointmentRepository;
     private final DentistRepository dentistRepository;
-    private final ObjectMapper objectMapper = new ObjectMapper();
-    private static final String APPOINTMENT_CONFIRMED = "CONFIRMED";
 
-    // Flow tokens identify which form produced a webhook nfm_reply.
-    private static final String FLOW_TOKEN_REGISTER = "doc-reg:";
-    private static final String FLOW_TOKEN_UPDATE_SEARCH = "doc-upd-srch:";
-    private static final String FLOW_TOKEN_UPDATE = "doc-upd:";
-    private static final String FLOW_TOKEN_SEARCH = "doc-srch:";
-    private static final String UPD_PAT_PREFIX = "UPD_PAT_";
-
-    /// Pending payment-flow flag. It is still shared across conversations and will be
-    /// migrated to a SessionState when the payment flow is refactored.
-    private boolean isLookingForPatient = false;
-
+    private boolean isWaitingDate = false;
     public WhatsAppBotService(WhatsAppClient whatsAppClient,
                               WhatsAppProperties properties,
                               WhatsAppContactRepository contactRepository,
@@ -108,11 +162,8 @@ public class WhatsAppBotService {
     private void handleIncomingMessage(WhatsAppWebhookPayload.IncomingMessage incomingMessage,
                                        List<WhatsAppWebhookPayload.Contact> contacts) {
         String fromPhone = incomingMessage.from();
-        // Flow responses arrive as interactive/nfm_reply with no text. Use the raw JSON
-        // so the message is not discarded by the blank-message guard below.
-        String messageBody = incomingMessage.isFlowResponse()
-                ? incomingMessage.getFlowResponseJson()
-                : incomingMessage.getExtractedText();
+        // Support both regular text and interactive button/list selections
+        String messageBody = incomingMessage.getExtractedText();
 
         if (fromPhone == null || messageBody == null || messageBody.isBlank()) {
             return;
@@ -137,12 +188,6 @@ public class WhatsAppBotService {
         // Record incoming message in DB
         saveMessageRecord(contact, incomingMessage.id(), "INCOMING", messageBody);
 
-        // WhatsApp Flow completion: route by flow_token, regardless of who sent it.
-        if (incomingMessage.isFlowResponse()) {
-            handleFlowResponse(fromPhone, incomingMessage.getFlowResponseJson());
-            return;
-        }
-
         // -----------------------------------------------------------------------------------
         // DOCTOR COMMANDS WORKFLOW
         // If the sender is the clinic doctor, route to dedicated administrative handlers
@@ -150,7 +195,7 @@ public class WhatsAppBotService {
         // -----------------------------------------------------------------------------------
         String doctorPhone = properties.getDoctor() != null ? properties.getDoctor().getPhoneNumber() : null;
         if (doctorPhone != null && !doctorPhone.isBlank() && fromPhone.equals(doctorPhone)) {
-            if (handleDoctorMessage(doctorPhone, incomingMessage, messageBody, contact)) {
+            if (handleDoctorMessage(doctorPhone, incomingMessage, messageBody)) {
                 return;
             }
         }
@@ -162,40 +207,31 @@ public class WhatsAppBotService {
                 .orElseGet(() -> {
                     WhatsAppSession newSession = new WhatsAppSession();
                     newSession.setWhatsAppContact(contact);
-                    newSession.setCurrentState(SessionState.INITIAL);
+                    newSession.setCurrentState("INITIAL");
                     newSession.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
                     return sessionRepository.save(newSession);
                 });
 
-        SessionState state = session.getCurrentState() != null
-                ? session.getCurrentState()
-                : SessionState.INITIAL;
+        String state = session.getCurrentState() != null ? session.getCurrentState() : "INITIAL";
 
-        // In development the doctor's phone can also act as a patient. DOC_IDLE means
-        // the doctor session is not in any doctor flow, so the patient intake may start.
-        boolean patientMode = doctorPhone != null && !doctorPhone.isBlank()
-                && fromPhone.equals(doctorPhone)
-                && properties.getDoctor().isPatientMode();
-
-        if (state == SessionState.INITIAL || state == SessionState.COMPLETED
-                || (patientMode && state == SessionState.DOC_IDLE)) {
+        if ("INITIAL".equalsIgnoreCase(state) || "COMPLETED".equalsIgnoreCase(state)) {
             // STEP 1 & 2: Patient greets the bot -> Bot responds asking for their full name & age
-            String greetingPrompt = "Hola! Bienvenido a Dental SmileDesign :).\n"
-                    + "Por favor escriba su *Primer Nombre * y *Edad* para que podamos notificar al doctor para su cita";
+            String greetingPrompt = "Hello! Welcome to Dental Clinic.\n"
+                    + "Please reply with your *Full Name* and *Age* (for example: *John Doe, 28*) so we can schedule your appointment with the Doctor.";
 
             whatsAppClient.sendTextMessage(fromPhone, greetingPrompt);
             saveMessageRecord(contact, null, "OUTGOING", greetingPrompt);
 
-            session.setCurrentState(SessionState.AWAITING_PATIENT_INFO);
+            session.setCurrentState("AWAITING_PATIENT_INFO");
             session.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
             sessionRepository.save(session);
 
-        } else if (state == SessionState.AWAITING_PATIENT_INFO) {
+        } else if ("AWAITING_PATIENT_INFO".equalsIgnoreCase(state)) {
             // STEP 3: Patient replies with their details
             ParsedPatientInfo parsedInfo = parsePatientInfo(messageBody);
 
             if (parsedInfo == null || parsedInfo.name == null || parsedInfo.age == null) {
-                String retryPrompt = "No pudimos extraer sus datos claramente. Inténtelo de nuevo como se muestra en el ejemplo* (Ejemplo: *Gabriel Santos, 25*).";
+                String retryPrompt = "We couldn't quite extract your details. Please reply with your *Full Name* and *Age* (e.g. *Gabriel Santos, 25*).";
                 whatsAppClient.sendTextMessage(fromPhone, retryPrompt);
                 saveMessageRecord(contact, null, "OUTGOING", retryPrompt);
                 return;
@@ -249,19 +285,16 @@ public class WhatsAppBotService {
                     + ", Cuando desearía recibir a este paciente?, aquí hay algunas sugerencias: \n"
                     + suggestedAppointment + ". Si desea, puede poner la fecha ud mismo de la siguiente manera \n"
                     + "*<día> de <mes> <hora> (Ejemplo: 20 de noviembre de 2026)*";
+            isWaitingDate = true;
             String recipientDoctor = (doctorPhone != null && !doctorPhone.isBlank()) ? doctorPhone : fromPhone;
-            WhatsAppSession doctorSession =
-                    getOrCreateDoctorSession(getOrCreateDoctorContact(recipientDoctor));
-            setDoctorState(doctorSession, SessionState.DOC_AWAITING_PATIENT_DATE);
             whatsAppClient.sendTextMessage(recipientDoctor, doctorMessage);
             log.info("Forwarded patient details to Doctor ({})", recipientDoctor);
 
-            session.setCurrentState(SessionState.COMPLETED);
+            session.setCurrentState("COMPLETED");
             session.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
             sessionRepository.save(session);
         }
     }
-
 
     /**
      * Handles administrative commands and interactive menu responses sent by the Doctor.
@@ -269,623 +302,1163 @@ public class WhatsAppBotService {
      * @param doctorPhone     The verified phone number of the doctor
      * @param incomingMessage The incoming webhook message payload
      * @param messageBody     Text content of the message or selected menu option
-     * @param doctorContact   The persisted contact of the doctor (session owner)
-     * @return true when the message was handled as a doctor action; false when the
-     *         doctor's number is in patient mode and the message must continue to the
-     *         patient intake flow
+     * @return true if the message was handled as a doctor command, false to allow default flow
      */
     private boolean handleDoctorMessage(String doctorPhone,
                                         WhatsAppWebhookPayload.IncomingMessage incomingMessage,
-                                        String messageBody,
-                                        WhatsAppContact doctorContact) {
-        String selectedOptionId = incomingMessage.getInteractiveSelectionId();
-        WhatsAppSession session = getOrCreateDoctorSession(doctorContact);
-        SessionState state = session.getCurrentState() != null
-                ? session.getCurrentState()
-                : SessionState.DOC_IDLE;
-        String text = messageBody == null ? "" : messageBody.trim();
-        boolean patientMode = properties.getDoctor().isPatientMode();
+                                        String messageBody) {
+        DoctorSession session = doctorSessions.computeIfAbsent(doctorPhone, key -> new DoctorSession());
+        synchronized (session) {
+            return handleDoctorMessageLocked(doctorPhone, incomingMessage, messageBody, session);
+        }
+    }
 
-        // 0) Doctor greeting -> interactive main menu. Skipped in patient mode so the
-        //    same phone can exercise the patient intake flow during development.
-        if (!patientMode && ("hola".equalsIgnoreCase(text)
-                || "menu".equalsIgnoreCase(text)
-                || "menú".equalsIgnoreCase(text))) {
+    private boolean handleDoctorMessageLocked(String doctorPhone,
+                                              WhatsAppWebhookPayload.IncomingMessage incomingMessage,
+                                              String messageBody,
+                                              DoctorSession session) {
+        String selectedOptionId = incomingMessage.getInteractiveSelectionId();
+        String trimmed = messageBody == null ? "" : messageBody.trim();
+
+        if (isMenuText(trimmed)) {
+            resetDoctorSession(session);
             sendDoctorMenu(doctorPhone);
             return true;
         }
 
-        boolean wantsAppointments = "CITAS".equals(selectedOptionId);
-        boolean wantsPayment = "PAGO".equals(selectedOptionId);
-        boolean wantSearchPatient = "SRCH_PAT".equals(selectedOptionId);
-        boolean wantsUpdateAppointment = "UPD_CITA".equals(selectedOptionId);
-        boolean wantsCreatePatient = "CRT_PAT".equals(selectedOptionId);
+        if (selectedOptionId != null && selectedOptionId.startsWith("DOC_MENU_")) {
+            return handleMenuSelection(doctorPhone, session, selectedOptionId);
+        }
 
-        // 1) Menu actions backed by static WhatsApp Flows (forms).
-        if (wantsCreatePatient) {
-            sendDoctorPatientRegistrationFlow(doctorPhone);
+        if (session.state != DoctorState.IDLE) {
+            return handleDoctorState(doctorPhone, session, trimmed, selectedOptionId);
+        }
+
+        if ("citas".equalsIgnoreCase(trimmed)) {
+            showAppointmentsPage(doctorPhone, 0);
             return true;
         }
-        if (wantsUpdateAppointment) {
-            sendDoctorUpdateSearchFlow(doctorPhone);
-            setDoctorState(session, SessionState.DOC_UPD_SEARCHING);
+        if ("pago".equalsIgnoreCase(trimmed)) {
+            sendTreatmentList(doctorPhone);
             return true;
         }
-        if (wantSearchPatient) {
-            sendDoctorSearchPatientFlow(doctorPhone);
-            return true;
-        }
-
-        // 2) Doctor selected a patient from the update search results.
-        if (selectedOptionId != null && selectedOptionId.startsWith(UPD_PAT_PREFIX)) {
-            return handleUpdatePatientSelected(doctorPhone, session, selectedOptionId);
-        }
-
-        // 3) Doctor confirming the date of an appointment created by the patient flow.
-        if (state == SessionState.DOC_AWAITING_PATIENT_DATE) {
-            return handlePatientDateConfirmation(doctorPhone, session, messageBody);
-        }
-
-        // 3) Show recent appointments.
-        if (wantsAppointments) {
-            Page<Appointment> appointmentsPage = showAppointmentsPage(0);
-            showAppointmentsPageMessage(doctorPhone, 0, appointmentsPage);
-            return true;
-        }
-
-        // 4) Pagination of the appointment list.
         if (selectedOptionId != null && selectedOptionId.startsWith("CITAS_PAGE_")) {
             try {
                 int nextPage = Integer.parseInt(selectedOptionId.replace("CITAS_PAGE_", ""));
-                Page<Appointment> appointmentsPage = showAppointmentsPage(nextPage);
-                showAppointmentsPageMessage(doctorPhone, nextPage, appointmentsPage);
+                showAppointmentsPage(doctorPhone, nextPage);
+            } catch (NumberFormatException e) {
+                log.error("Failed to parse page number from action id: {}", selectedOptionId, e);
+            }
+            return true;
+        }
+        if (selectedOptionId != null && selectedOptionId.startsWith(PATIENTS_PAGE_PREFIX)) {
+            try {
+                int nextPage = Integer.parseInt(selectedOptionId.replace(PATIENTS_PAGE_PREFIX, ""));
+                showPatientsPage(doctorPhone, nextPage);
             } catch (NumberFormatException e) {
                 log.error("Failed to parse page number from action id: {}", selectedOptionId, e);
             }
             return true;
         }
 
-
-        // 6) Payment flow: doctor types PAGO -> choose the patient (or go to treatments).
-        if (wantsPayment) {
-            List<SendInteractiveListRequest.Row> patientRows = patientRepository
-                    .findAllByPatientState(PatientState.ON_TRACKING).stream()
-                    .limit(10)
-                    .map(p -> new SendInteractiveListRequest.Row(
-                            "PAT_" + p.getPatientUUID(),
-                            p.getPatientName(),
-                            "Edad: " + (p.getPatientAge() != null ? p.getPatientAge() : "N/A")))
-                    .toList();
-
-            if (!patientRows.isEmpty()) {
-                whatsAppClient.sendInteractiveList(doctorPhone,
-                        "Cuál paciente se acabó de atender?", "Ver Pacientes", patientRows);
-                isLookingForPatient = true;
+        if (isWaitingDate && selectedOptionId == null) {
+            if (handleDoctorDateConfirmation(doctorPhone, trimmed)) {
                 return true;
             }
-
-            return sendTreatmentList(doctorPhone);
         }
 
-        // 7) Doctor tapped a treatment from the interactive list.
-        if (selectedOptionId != null && selectedOptionId.startsWith("TREAT_")) {
-            long treatmentId = Long.parseLong(selectedOptionId.replace("TREAT_", ""));
-            Optional<Treatments> treatmentsOptional = treatmentsRepository.findById(treatmentId);
-
-            if (treatmentsOptional.isPresent()) {
-                Treatments selectedTreatment = treatmentsOptional.get();
-                String confirmationText = "Tratamiento registrado con éxito: *" + messageBody + "*.\n"
-                        + "El pago del paciente es de: $" + selectedTreatment.getPrice();
-                whatsAppClient.sendTextMessage(doctorPhone, confirmationText);
-                log.info("Doctor selected treatment option: id={}, title={}, price={}",
-                        selectedTreatment.getId(),
-                        selectedTreatment.getTreatment(),
-                        selectedTreatment.getPrice());
-            }
-
-            whatsAppClient.sendInteractiveButtons(doctorPhone,
-                    "De qué forma realizó el pago el paciente?: \n", paymentMethodButtons());
+        if (selectedOptionId != null
+                && !selectedOptionId.startsWith("UPD_")
+                && !selectedOptionId.startsWith("REG_")) {
+            handleLegacyTreatmentSelection(doctorPhone, messageBody, selectedOptionId);
             return true;
         }
 
-        // 8) Payment method / payment status buttons.
-        boolean isPaymentAction = "PAY_EFECTIVO".equals(selectedOptionId)
-                || "PAY_TRANSFERENCIA".equals(selectedOptionId)
-                || "PAT_STAT_COMPLETE".equals(selectedOptionId)
-                || "PAT_STAT_PARTIALLY".equals(selectedOptionId)
-                || "PAT_STAT_INDEBT".equals(selectedOptionId);
-
-        if (isPaymentAction) {
-            try {
-                Optional<Appointment> latestAppt = appointmentRepository.findTopByOrderByCreatedAtDesc();
-                if (latestAppt.isPresent()) {
-                    Appointment appt = latestAppt.get();
-                    Patient patient = appt.getPatientAppointment();
-
-                    if (patient != null) {
-                        if ("PAT_STAT_COMPLETE".equals(selectedOptionId)) {
-                            patient.setPatientPaymentState(PatientPaymentState.COMPLETE);
-                        } else if ("PAT_STAT_PARTIALLY".equals(selectedOptionId)) {
-                            patient.setPatientPaymentState(PatientPaymentState.PARTIALLY);
-                        } else if ("PAT_STAT_INDEBT".equals(selectedOptionId)) {
-                            patient.setPatientPaymentState(PatientPaymentState.IN_DEBT);
-                        }
-                        patientRepository.save(patient);
-                    }
-
-                    appointmentRepository.save(appt);
-                    whatsAppClient.sendInteractiveButtons(doctorPhone,
-                            "El Paciente ha pagado todo, parcialmente, o queda debiéndole?",
-                            paymentStatusButtons());
-                }
-            } catch (Exception e) {
-                log.error("Failed to update the patient payment state", e);
-                whatsAppClient.sendTextMessage(doctorPhone,
-                        "Ha fallado al obtener el método de pago en el sistema");
-            }
-            return true;
-        }
-
-        // Unknown message. In patient mode let the patient flow handle it; otherwise
-        // show the menu again so the doctor always has a way forward.
-        if (patientMode) {
-            return false;
-        }
-        sendDoctorMenu(doctorPhone);
+        whatsAppClient.sendTextMessage(doctorPhone,
+                "No entendí. Escriba *hola* para ver las opciones disponibles.");
         return true;
+    }
+
+    private boolean isMenuText(String text) {
+        String normalized = normalize(text);
+        return normalized.equals("hola") || normalized.equals("menu") || normalized.equals("opciones");
     }
 
     private void sendDoctorMenu(String doctorPhone) {
-        whatsAppClient.sendInteractiveList(
-                doctorPhone,
-                "¿Qué desea hacer?",
-                "Ver Opciones",
-                doctorMainOptions());
+        List<SendInteractiveListRequest.Row> rows = List.of(
+                new SendInteractiveListRequest.Row(MENU_SEARCH, "Buscar", "Buscar paciente"),
+                new SendInteractiveListRequest.Row(MENU_UPDATE, "Cambiar", "Actualizar paciente o cita"),
+                new SendInteractiveListRequest.Row(MENU_PAY, "Cobrar", "Registrar pago de paciente"),
+                new SendInteractiveListRequest.Row(MENU_PATIENTS, "Pacientes", "Mostrar todos los pacientes"),
+                new SendInteractiveListRequest.Row(MENU_REGISTER, "Registrar paciente", "Registrar un nuevo paciente")
+        );
+        whatsAppClient.sendInteractiveList(doctorPhone,
+                "¡Hola Doctor! ¿Qué desea hacer?", MENU_BUTTON, rows);
     }
 
-    // ===================================================================================
-    // WHATSAPP FLOWS (static forms)
-    // ===================================================================================
+    private boolean handleMenuSelection(String doctorPhone, DoctorSession session, String menuId) {
+        resetDoctorSession(session);
+        switch (menuId) {
+            case MENU_SEARCH -> startSearchFlow(doctorPhone, session, false);
+            case MENU_UPDATE -> sendUpdateTargetButtons(doctorPhone, session);
+            case MENU_PAY -> sendTreatmentList(doctorPhone);
+            case MENU_PATIENTS -> showPatientsPage(doctorPhone, 0);
+            case MENU_REGISTER -> startPatientRegistration(doctorPhone, session);
+            default -> sendDoctorMenu(doctorPhone);
+        }
+        return true;
+    }
 
-    private boolean sendDoctorPatientRegistrationFlow(String doctorPhone) {
-        String flowId = properties.getFlows().getPatientRegistration();
-        if (flowId == null || flowId.isBlank()) {
-            whatsAppClient.sendTextMessage(doctorPhone,
-                    "El formulario de registro de paciente no está configurado.");
+    private boolean handleDoctorState(String doctorPhone, DoctorSession session,
+                                      String message, String selectedOptionId) {
+        switch (session.state) {
+            case AWAITING_SEARCH_QUERY -> handleSearchQuery(doctorPhone, session, message);
+            case UPDATE_AWAITING_TARGET ->
+                    handleUpdateTargetSelection(doctorPhone, session, message, selectedOptionId);
+            case UPDATE_AWAITING_PATIENT_SELECTION ->
+                    handleUpdatePatientSelection(doctorPhone, session, selectedOptionId);
+            case UPDATE_AWAITING_APPOINTMENT_SELECTION ->
+                    handleUpdateAppointmentSelection(doctorPhone, session, selectedOptionId);
+            case UPDATE_AWAITING_FIELD_SELECTION ->
+                    handleUpdateFieldSelection(doctorPhone, session, selectedOptionId);
+            case UPDATE_AWAITING_NEW_VALUE -> handleUpdateNewValue(doctorPhone, session, message);
+            case UPDATE_AWAITING_CONFIRM ->
+                    handleUpdateConfirmation(doctorPhone, session, selectedOptionId, message);
+            case REGISTER_AWAITING_FIELD -> handleRegisterNewValue(doctorPhone, session, message);
+            default -> {
+                resetDoctorSession(session);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void resetDoctorSession(DoctorSession session) {
+        session.state = DoctorState.IDLE;
+        session.updateMode = false;
+        session.updateTarget = null;
+        session.patientCandidates.clear();
+        session.selectedPatientId = null;
+        session.appointmentCandidates.clear();
+        session.selectedAppointmentId = null;
+        session.selectedField = null;
+        session.pendingChanges.clear();
+        session.registeringPatientId = null;
+        session.registerFieldIndex = 0;
+    }
+
+    private boolean handleDoctorDateConfirmation(String doctorPhone, String messageBody) {
+        LocalDateTime customDate = parsedDoctorCustomizedDate(messageBody);
+        if (customDate == null) {
+            String retryMsg = "No logré reconocer la fecha. Por favor indíquela como: *día de mes hora* (Ejemplo: *24 de noviembre 10:00am*) o envíe *citas* para ver el listado.";
+            whatsAppClient.sendTextMessage(doctorPhone, retryMsg);
+            return true;
+        }
+
+        Optional<Appointment> latestPendingAppt =
+                appointmentRepository.findTopByAppointmentStatusOrderByCreatedAtDesc("PENDING");
+        if (latestPendingAppt.isEmpty()) {
+            log.warn("isWaitingDate is true, but no PENDING appointment was found in DB.");
+            isWaitingDate = false;
             return false;
         }
-        String flowToken = FLOW_TOKEN_REGISTER + UUID.randomUUID();
-        return whatsAppClient.sendFlow(
-                doctorPhone, flowId, flowToken,
-                "Abrir formulario",
-                "Registrar paciente",
-                "Complete los datos del paciente y la fecha de la cita.",
-                null, "PATIENT_REGISTRATION", null);
+
+        Appointment appointment = latestPendingAppt.get();
+        appointment.setStartAppointmentAt(Timestamp.valueOf(customDate));
+        appointment.setAppointmentStatus("CONFIRMED");
+        appointmentRepository.save(appointment);
+
+        isWaitingDate = false;
+
+        DateTimeFormatter formatter =
+                DateTimeFormatter.ofPattern("dd/MM/yyyy 'a las' hh:mma", Locale.of("es", "ES"));
+        String formattedDate = customDate.format(formatter);
+        whatsAppClient.sendTextMessage(doctorPhone,
+                "✅ Cita confirmada con éxito para el *" + formattedDate + "*.");
+
+        if (appointment.getPatientAppointment() != null
+                && appointment.getPatientAppointment().getPatientPhone() != null) {
+            String patientPhone = appointment.getPatientAppointment().getPatientPhone();
+            whatsAppClient.sendTextMessage(patientPhone,
+                    "¡Hola! El doctor ha confirmado tu cita para el *"
+                            + formattedDate + "*. Te esperamos en la clínica.");
+        }
+        return true;
     }
 
-    private boolean sendDoctorUpdateSearchFlow(String doctorPhone) {
-        String flowId = properties.getFlows().getSearchPatient();
-        if (flowId == null || flowId.isBlank()) {
+    private void sendTreatmentList(String doctorPhone) {
+        List<SendInteractiveListRequest.Row> treatmentRows =
+                treatmentsRepository.getAllTreatmentsIgnoreCase();
+        whatsAppClient.sendInteractiveList(doctorPhone,
+                "Doctor, por favor seleccione el tratamiento que recibió el paciente:",
+                "Ver Tratamientos", treatmentRows);
+        log.info("Dispatched interactive treatment list to Doctor ({})", doctorPhone);
+    }
+
+    private void handleLegacyTreatmentSelection(String doctorPhone,
+                                                String messageBody,
+                                                String selectedOptionId) {
+        log.info("Doctor selected treatment option: id={}, title={}", selectedOptionId, messageBody);
+        String confirmationText = "Tratamiento registrado con éxito: *" + messageBody + "*.\n"
+                + "El pago del paciente es de: $" + treatmentsRepository.findPriceByTreatment(selectedOptionId);
+        whatsAppClient.sendTextMessage(doctorPhone, confirmationText);
+
+        String promptForPayment = "De qué forma realizó el pago el paciente?: \n";
+        String buttonTextPayment = "Ver métodos de pago";
+        List<SendInteractiveListRequest.Row> paymentMethods = List.of(
+                new SendInteractiveListRequest.Row("PAY_TRANSFERENCIA", "TRANSFERENCIA", "Por Banca móvil de cualquier banco"),
+                new SendInteractiveListRequest.Row("PAY_EFECTIVO", "EFECTIVO", "Billetes/monedas")
+        );
+        whatsAppClient.sendInteractiveList(doctorPhone, promptForPayment, buttonTextPayment, paymentMethods);
+        if ("PAY_TRANSFERENCIA".equals(selectedOptionId)) {
             whatsAppClient.sendTextMessage(doctorPhone,
-                    "El formulario de búsqueda de pacientes no está configurado.");
-            return false;
-        }
-        String flowToken = FLOW_TOKEN_UPDATE_SEARCH + UUID.randomUUID();
-        return whatsAppClient.sendFlow(
-                doctorPhone, flowId, flowToken,
-                "Buscar",
-                "Buscar paciente",
-                "Escriba el nombre o la fecha del paciente que desea actualizar.",
-                null, "SEARCH_PATIENT", null);
-    }
-
-    private boolean sendDoctorUpdateAppointmentFlow(String doctorPhone,
-                                                    Patient patient,
-                                                    Appointment appointment) {
-        String flowId = properties.getFlows().getUpdateAppointment();
-        if (flowId == null || flowId.isBlank()) {
-            whatsAppClient.sendTextMessage(doctorPhone,
-                    "El formulario para modificar citas no está configurado.");
-            return false;
-        }
-
-        String flowToken = FLOW_TOKEN_UPDATE + patient.getPatientUUID()
-                + ":" + UUID.randomUUID();
-
-        Map<String, Object> initialData = new LinkedHashMap<>();
-        initialData.put("default_name",
-                patient.getPatientName() == null ? "" : patient.getPatientName());
-
-        if (appointment.getStartAppointmentAt() != null) {
-            LocalDateTime start = appointment.getStartAppointmentAt().toLocalDateTime();
-            initialData.put("default_date", start.toLocalDate().toString());
-            initialData.put("default_time",
-                    start.toLocalTime().format(DateTimeFormatter.ofPattern("HH:mm")));
-        } else {
-            initialData.put("default_date", "");
-            initialData.put("default_time", "");
-        }
-
-        initialData.put("default_treatment", currentTreatmentName(appointment));
-        initialData.put("default_payment_method",
-                mapPaymentMethodToFlowId(appointment.getPaymentMethod()));
-        initialData.put("default_payment_status",
-                mapPaymentStatusToFlowId(patient.getPatientPaymentState()));
-
-        return whatsAppClient.sendFlow(
-                doctorPhone, flowId, flowToken,
-                "Abrir formulario",
-                "Modificar cita",
-                "Los datos actuales están precargados. Cambie lo que necesite.",
-                null, "UPDATE_APPOINTMENT", initialData);
-    }
-
-    private boolean sendDoctorSearchPatientFlow(String doctorPhone) {
-        String flowId = properties.getFlows().getSearchPatient();
-        if (flowId == null || flowId.isBlank()) {
-            whatsAppClient.sendTextMessage(doctorPhone,
-                    "El formulario de búsqueda de pacientes no está configurado.");
-            return false;
-        }
-        String flowToken = FLOW_TOKEN_SEARCH + UUID.randomUUID();
-        return whatsAppClient.sendFlow(
-                doctorPhone, flowId, flowToken,
-                "Buscar",
-                "Buscar paciente",
-                "Escriba el nombre del paciente que desea buscar.",
-                null, "SEARCH_PATIENT", null);
-    }
-
-    private String currentTreatmentName(Appointment appointment) {
-        if (appointment.getTreatments() == null || appointment.getTreatments().isEmpty()) {
-            return "";
-        }
-        return appointment.getTreatments().get(0).getTreatment();
-    }
-
-    private String mapPaymentMethodToFlowId(PaymentMethod method) {
-        if (method == null) {
-            return "";
-        }
-        return switch (method) {
-            case CASH -> "PAY_EFECTIVO";
-            case TRANSFER -> "PAY_TRANSFERENCIA";
-        };
-    }
-
-    private String mapPaymentStatusToFlowId(PatientPaymentState status) {
-        if (status == null) {
-            return "";
-        }
-        return switch (status) {
-            case COMPLETE -> "PAT_STAT_COMPLETE";
-            case PARTIALLY -> "PAT_STAT_PARTIALLY";
-            case IN_DEBT -> "PAT_STAT_INDEBT";
-            case UNDEFINED_PRICE -> "";
-        };
-    }
-
-    /**
-     * Handles the webhook message produced when a user completes a Flow.
-     * The form type is identified by the {@code flow_token} prefix.
-     */
-    private void handleFlowResponse(String fromPhone, String responseJson) {
-        if (responseJson == null || responseJson.isBlank()) {
-            log.warn("Empty Flow response from {}", fromPhone);
-            return;
-        }
-
-        Map<String, Object> data;
-        try {
-            data = objectMapper.readValue(
-                    responseJson, new TypeReference<Map<String, Object>>() {});
-        } catch (Exception e) {
-            log.error("Invalid Flow response JSON from {}: {}", fromPhone, responseJson, e);
-            whatsAppClient.sendTextMessage(fromPhone, "No pudimos leer el formulario. Intente de nuevo.");
-            return;
-        }
-
-        String token = asString(data.get("flow_token"));
-        log.info("Flow response from {} (token={}): {}", fromPhone, token, data);
-
-        if (token == null) {
-            whatsAppClient.sendTextMessage(fromPhone, "No pudimos identificar el formulario.");
-            return;
-        }
-        if (token.startsWith(FLOW_TOKEN_REGISTER)) {
-            handleDoctorPatientRegistrationFlow(fromPhone, data);
-        } else if (token.startsWith(FLOW_TOKEN_UPDATE_SEARCH)) {
-            handleUpdatePatientSearchFlow(fromPhone, data);
-        } else if (token.startsWith(FLOW_TOKEN_UPDATE)) {
-            handleDoctorUpdateAppointmentFlow(fromPhone, data);
-        } else if (token.startsWith(FLOW_TOKEN_SEARCH)) {
-            handleDoctorSearchPatientFlow(fromPhone, data);
-        } else {
-            log.warn("Unknown Flow token '{}' from {}", token, fromPhone);
-            whatsAppClient.sendTextMessage(fromPhone, "Formulario no reconocido.");
+                    "El Paciente ha pagado todo, parcialmente, o queda debiéndole?");
         }
     }
 
-    private void handleDoctorPatientRegistrationFlow(String doctorPhone, Map<String, Object> data) {
-        String name = asString(data.get("full_name"));
-        Integer age = asInteger(data.get("age"));
-        LocalDate date = asLocalDate(data.get("appointment_date"));
-        LocalTime time = asLocalTime(data.get("appointment_time"));
-
-        if (name == null || name.isBlank() || age == null || date == null) {
-            whatsAppClient.sendTextMessage(doctorPhone,
-                    "Faltan datos del paciente. Abra el formulario e intente de nuevo.");
-            return;
-        }
-        if (time == null) {
-            time = LocalTime.of(10, 0);
-        }
-
+    private void startPatientRegistration(String doctorPhone, DoctorSession session) {
         Patient patient = new Patient();
-        patient.setPatientName(name);
-        patient.setPatientAge(age);
-        patient.setPatientState(PatientState.ON_TRACKING);
-        patient.setPatientPaymentState(PatientPaymentState.UNDEFINED_PRICE);
+        patient.setPatientState(PatientState.UNDEFINED);
         patient = patientRepository.save(patient);
 
-        LocalDateTime start = LocalDateTime.of(date, time);
-        Appointment appointment = new Appointment();
-        appointment.setPatientAppointment(patient);
-        appointment.setCategory("Consultation");
-        appointment.setAppointmentStatus(APPOINTMENT_CONFIRMED);
-        appointment.setPatientState(PatientState.UNDEFINED);
-        appointment.setCreatedAt(now());
-        appointment.setStartAppointmentAt(Timestamp.valueOf(start));
-        dentistRepository.findFirstByIsDentistActiveTrue().ifPresent(appointment::setDentistAppointment);
-        appointmentRepository.save(appointment);
+        session.registeringPatientId = patient.getPatientUUID();
+        session.registerFieldIndex = 0;
+        session.state = DoctorState.REGISTER_AWAITING_FIELD;
+        askRegisterField(doctorPhone, session);
+    }
 
-        patient.setAppointment(start);
+    private void askRegisterField(String doctorPhone, DoctorSession session) {
+        String field = PATIENT_REGISTRATION_FIELDS.get(session.registerFieldIndex);
+        switch (field) {
+            case "patientState" -> whatsAppClient.sendInteractiveButtons(doctorPhone,
+                    "¿Cuál es el estado del paciente?",
+                    List.of(
+                            SendInteractiveButtonRequest.replyButton(
+                                    "REG_STATE_UNDEFINED", "POR DEFINIR"),
+                            SendInteractiveButtonRequest.replyButton(
+                                    "REG_STATE_ON_TRACKING", "EN SEGUIMIENTO"),
+                            SendInteractiveButtonRequest.replyButton(
+                                    "REG_STATE_CLOSED", "CERRADO")
+                    ));
+            case "patientPaymentState" -> whatsAppClient.sendInteractiveList(doctorPhone,
+                    "¿Cuál es el estado de pago del paciente?",
+                    "Ver Estados",
+                    List.of(
+                            new SendInteractiveListRequest.Row(
+                                    "REG_PAY_COMPLETE", "COMPLETO", null),
+                            new SendInteractiveListRequest.Row(
+                                    "REG_PAY_PARTIALLY", "PARCIALMENTE", null),
+                            new SendInteractiveListRequest.Row(
+                                    "REG_PAY_IN_DEBT", "EN DEUDA", null),
+                            new SendInteractiveListRequest.Row(
+                                    "REG_PAY_UNDEFINED_PRICE", "POR DEFINIR", null)
+                    ));
+            default -> whatsAppClient.sendTextMessage(doctorPhone, registerFieldPrompt(field));
+        }
+    }
+
+    private void handleRegisterNewValue(String doctorPhone, DoctorSession session, String message) {
+        String field = PATIENT_REGISTRATION_FIELDS.get(session.registerFieldIndex);
+        Object value;
+        try {
+            value = parseFieldValue(field, message);
+        } catch (IllegalArgumentException e) {
+            whatsAppClient.sendTextMessage(doctorPhone, e.getMessage());
+            askRegisterField(doctorPhone, session);
+            return;
+        }
+
+        Patient patient = patientRepository.findById(session.registeringPatientId).orElse(null);
+        if (patient == null) {
+            whatsAppClient.sendTextMessage(doctorPhone,
+                    "No se encontró el paciente en registro.");
+            resetDoctorSession(session);
+            return;
+        }
+
+        switch (field) {
+            case "patientName" -> patient.setPatientName((String) value);
+            case "patientLastname" -> patient.setPatientLastname((String) value);
+            case "patientPhone" -> patient.setPatientPhone((String) value);
+            case "patientAge" -> patient.setPatientAge((Integer) value);
+            case "patientState" -> patient.setPatientState((PatientState) value);
+            case "patientPaymentState" ->
+                    patient.setPatientPaymentState((PatientPaymentState) value);
+            default -> {
+            }
+        }
         patientRepository.save(patient);
 
-        whatsAppClient.sendTextMessage(doctorPhone,
-                "✅ Paciente *" + name + "* registrado con cita para el *"
-                        + formatAppointment(start) + "*.");
+        session.registerFieldIndex++;
+        if (session.registerFieldIndex >= PATIENT_REGISTRATION_FIELDS.size()) {
+            whatsAppClient.sendTextMessage(doctorPhone,
+                    "Paciente *" + fullName(patient) + "* registrado con éxito.");
+            resetDoctorSession(session);
+            return;
+        }
+        askRegisterField(doctorPhone, session);
     }
 
-    private void handleDoctorUpdateAppointmentFlow(String doctorPhone, Map<String, Object> data) {
-        String token = asString(data.get("flow_token"));
-        String patientName = asString(data.get("patient_name"));
-        LocalDate date = asLocalDate(data.get("new_date"));
-        LocalTime time = asLocalTime(data.get("new_time"));
-        String treatmentName = asString(data.get("patient_treatment"));
-        String paymentMethodId = asString(data.get("payment_method"));
-        String paymentStatusId = asString(data.get("payment_status"));
+    private String registerFieldPrompt(String field) {
+        return switch (field) {
+            case "patientName" -> "¿Cuál es el nombre/s del paciente?";
+            case "patientLastname" -> "¿Cuál es el apellido del paciente?";
+            case "patientPhone" -> "¿Cuál es el teléfono del paciente?";
+            case "patientAge" -> "¿Cuál es la edad del paciente?";
+            case "patientState" ->
+                    "¿Cuál es el estado del paciente? (POR DEFINIR, EN SEGUIMIENTO, CERRADO)";
+            case "patientPaymentState" ->
+                    "¿Cuál es el estado de pago del paciente? (COMPLETO, PARCIALMENTE, EN DEUDA, POR DEFINIR)";
+            default -> "Ingrese el valor:";
+        };
+    }
 
-        UUID patientUUID = parseUpdatePatientUUID(token);
+    private void startSearchFlow(String doctorPhone, DoctorSession session, boolean updateMode) {
+        session.patientCandidates.clear();
+        session.selectedPatientId = null;
+        session.appointmentCandidates.clear();
+        session.selectedAppointmentId = null;
+        session.selectedField = null;
+        session.pendingChanges.clear();
+        session.updateMode = updateMode;
+        session.state = DoctorState.AWAITING_SEARCH_QUERY;
+        whatsAppClient.sendTextMessage(doctorPhone, SEARCH_PROMPT);
+    }
 
-        Optional<Appointment> latest;
-        if (patientUUID != null) {
-            latest = appointmentRepository
-                    .findTopByPatientAppointment_PatientUUIDOrderByCreatedAtDesc(patientUUID);
+    private void sendUpdateTargetButtons(String doctorPhone, DoctorSession session) {
+        session.updateMode = true;
+        session.updateTarget = null;
+        session.state = DoctorState.UPDATE_AWAITING_TARGET;
+        whatsAppClient.sendInteractiveButtons(doctorPhone, "¿Qué desea buscar?",
+                List.of(
+                        SendInteractiveButtonRequest.replyButton(TARGET_PATIENT, "PACIENTE"),
+                        SendInteractiveButtonRequest.replyButton(TARGET_CITA, "CITA")
+                ));
+    }
+
+    private void handleUpdateTargetSelection(String doctorPhone, DoctorSession session,
+                                             String message, String selectedOptionId) {
+        String id = selectedOptionId;
+        if (id == null) {
+            String normalized = normalize(message);
+            if (normalized.equals("paciente")) {
+                id = TARGET_PATIENT;
+            } else if (normalized.equals("cita")) {
+                id = TARGET_CITA;
+            }
+        }
+
+        if (TARGET_PATIENT.equals(id)) {
+            session.updateTarget = UpdateTarget.PATIENT;
+            startSearchFlow(doctorPhone, session, true);
+        } else if (TARGET_CITA.equals(id)) {
+            session.updateTarget = UpdateTarget.CITA;
+            startSearchFlow(doctorPhone, session, true);
         } else {
-            // Fallback for older forms. New forms always carry the patient UUID in the token.
-            if (patientName == null || patientName.isBlank()) {
-                whatsAppClient.sendTextMessage(doctorPhone,
-                        "No pudimos identificar al paciente de este formulario.");
-                return;
-            }
-            latest = appointmentRepository
-                    .findTopByPatientAppointment_PatientNameContainingIgnoreCaseOrderByCreatedAtDesc(patientName);
+            sendUpdateTargetButtons(doctorPhone, session);
         }
+    }
 
-        if (latest.isEmpty()) {
-            whatsAppClient.sendTextMessage(doctorPhone,
-                    "No encontré una cita para el paciente indicado.");
+    private void handleSearchQuery(String doctorPhone, DoctorSession session, String query) {
+        if (query == null || query.isBlank()) {
+            whatsAppClient.sendTextMessage(doctorPhone, SEARCH_PROMPT);
             return;
         }
 
-        Appointment appointment = latest.get();
-        Patient patient = appointment.getPatientAppointment();
-        LocalDateTime updatedStart = appointment.getStartAppointmentAt() == null
-                ? null
-                : appointment.getStartAppointmentAt().toLocalDateTime();
-
-        if (date != null) {
-            LocalTime effectiveTime = time != null ? time : LocalTime.of(10, 0);
-            updatedStart = LocalDateTime.of(date, effectiveTime);
-            appointment.setStartAppointmentAt(Timestamp.valueOf(updatedStart));
-            appointment.setAppointmentStatus(APPOINTMENT_CONFIRMED);
-            if (patient != null) {
-                patient.setAppointment(updatedStart);
-            }
-        }
-
-        if (treatmentName != null && !treatmentName.isBlank()) {
-            treatmentsRepository.findByTreatmentIgnoreCase(treatmentName)
-                    .ifPresent(treatment -> appointment.setTreatments(List.of(treatment)));
-        }
-
-        if (paymentMethodId != null) {
-            PaymentMethod method = mapPaymentMethod(paymentMethodId);
-            if (method != null) {
-                appointment.setPaymentMethod(method);
-            }
-        }
-
-        if (paymentStatusId != null && patient != null) {
-            PatientPaymentState status = mapPaymentStatus(paymentStatusId);
-            if (status != null) {
-                patient.setPatientPaymentState(status);
-            }
-        }
-
-        appointmentRepository.save(appointment);
-        if (patient != null) {
-            patientRepository.save(patient);
-        }
-
-        String when = updatedStart == null ? "la fecha indicada" : formatAppointment(updatedStart);
-        String displayName = patient != null && patient.getPatientName() != null
-                ? patient.getPatientName()
-                : (patientName == null || patientName.isBlank() ? "paciente" : patientName);
-        whatsAppClient.sendTextMessage(doctorPhone,
-                "✅ La cita de *" + displayName + "* fue actualizada para el *" + when + "*.");
-
-        if (patient != null && patient.getPatientPhone() != null) {
-            whatsAppClient.sendTextMessage(patient.getPatientPhone(),
-                    "¡Hola! Tu cita fue actualizada para el *" + when + "*.");
-        }
-    }
-
-    private UUID parseUpdatePatientUUID(String token) {
-        if (token == null || !token.startsWith(FLOW_TOKEN_UPDATE)) {
-            return null;
-        }
-        String rest = token.substring(FLOW_TOKEN_UPDATE.length());
-        int separator = rest.indexOf(':');
-        if (separator <= 0) {
-            return null;
-        }
-        try {
-            return UUID.fromString(rest.substring(0, separator));
-        } catch (IllegalArgumentException e) {
-            log.warn("Invalid update flow token '{}'", token);
-            return null;
-        }
-    }
-
-    private PaymentMethod mapPaymentMethod(String id) {
-        return switch (id) {
-            case "PAY_EFECTIVO", "cash" -> PaymentMethod.CASH;
-            case "PAY_TRANSFERENCIA", "transfer" -> PaymentMethod.TRANSFER;
-            default -> null;
-        };
-    }
-
-    private PatientPaymentState mapPaymentStatus(String id) {
-        return switch (id) {
-            case "PAT_STAT_COMPLETE", "complete" -> PatientPaymentState.COMPLETE;
-            case "PAT_STAT_PARTIALLY", "partially" -> PatientPaymentState.PARTIALLY;
-            case "PAT_STAT_INDEBT", "inDebt" -> PatientPaymentState.IN_DEBT;
-            default -> null;
-        };
-    }
-
-    private void handleDoctorSearchPatientFlow(String doctorPhone, Map<String, Object> data) {
-        String name = asString(data.get("patient_name"));
-        LocalDate date = asLocalDate(data.get("new_date"));
-
-        if ((name == null || name.isBlank()) && date == null) {
-            whatsAppClient.sendTextMessage(doctorPhone,
-                    "Escriba un nombre o seleccione una fecha para buscar.");
+        SearchOutcome outcome = searchPatientsAndAppointments(query);
+        if (outcome.patients().isEmpty()) {
+            whatsAppClient.sendTextMessage(doctorPhone, NOT_FOUND_MESSAGE);
+            resetDoctorSession(session);
             return;
         }
 
-        List<Appointment> appointments = searchAppointments(name, date);
-        if (appointments.isEmpty()) {
-            whatsAppClient.sendTextMessage(doctorPhone, "No encontré resultados.");
+        if (session.updateMode) {
+            session.patientCandidates = outcome.patients().stream()
+                    .map(Patient::getPatientUUID)
+                    .collect(Collectors.toCollection(ArrayList::new));
+
+            if (outcome.patients().size() == 1) {
+                session.selectedPatientId = outcome.patients().get(0).getPatientUUID();
+                proceedAfterPatientSelected(doctorPhone, session);
+            } else {
+                sendPatientSelectionList(doctorPhone, outcome.patients());
+                session.state = DoctorState.UPDATE_AWAITING_PATIENT_SELECTION;
+            }
             return;
         }
 
-        StringBuilder sb = new StringBuilder("🔎 Resultados:\n\n");
-        for (Appointment appointment : appointments) {
-            Patient patient = appointment.getPatientAppointment();
-            sb.append("• ").append(patient != null ? patient.getPatientName() : "Sin nombre");
-            if (patient != null && patient.getPatientAge() != null) {
-                sb.append(", ").append(patient.getPatientAge()).append(" años");
-            }
-            if (appointment.getStartAppointmentAt() != null) {
-                sb.append(" — ").append(appointment.getStartAppointmentAt().toLocalDateTime()
-                        .format(DateTimeFormatter.ofPattern("dd/MM/yyyy hh:mma",
-                                Locale.of("es", "ES"))));
-            }
-            sb.append("\n");
+        if (outcome.patients().size() == 1) {
+            Patient patient = outcome.patients().get(0);
+            showPatientDetails(doctorPhone, patient,
+                    outcome.appointmentsByPatient().getOrDefault(patient.getPatientUUID(), List.of()));
+        } else {
+            sendSearchResultsList(doctorPhone, outcome);
         }
-        whatsAppClient.sendTextMessage(doctorPhone, sb.toString().trim());
+        resetDoctorSession(session);
     }
 
-    private List<Appointment> searchAppointments(String name, LocalDate date) {
-        boolean hasName = name != null && !name.isBlank();
-
-        if (hasName && date != null) {
-            return appointmentRepository
-                    .findByPatientAppointment_PatientNameContainingIgnoreCaseAndStartAppointmentAtBetween(
-                            name, startOfDay(date), startOfNextDay(date));
-        }
-        if (hasName) {
-            return appointmentRepository
-                    .findByPatientAppointment_PatientNameContainingIgnoreCase(name);
-        }
-        return appointmentRepository.findByStartAppointmentAtBetween(
-                startOfDay(date), startOfNextDay(date));
-    }
-
-    private void handleUpdatePatientSearchFlow(String doctorPhone, Map<String, Object> data) {
-        String name = asString(data.get("patient_name"));
-        LocalDate date = asLocalDate(data.get("new_date"));
-
-        if ((name == null || name.isBlank()) && date == null) {
-            whatsAppClient.sendTextMessage(doctorPhone,
-                    "Escriba un nombre o seleccione una fecha para buscar.");
-            return;
-        }
-
-        List<Appointment> appointments = searchAppointments(name, date);
-        if (appointments.isEmpty()) {
-            whatsAppClient.sendTextMessage(doctorPhone, "No encontré resultados.");
-            return;
-        }
-
-        Map<UUID, Patient> patients = new LinkedHashMap<>();
-        for (Appointment appointment : appointments) {
-            Patient patient = appointment.getPatientAppointment();
-            if (patient != null) {
-                patients.putIfAbsent(patient.getPatientUUID(), patient);
-            }
-        }
-
-        List<SendInteractiveListRequest.Row> rows = patients.values().stream()
+    private void sendPatientSelectionList(String doctorPhone, List<Patient> patients) {
+        List<SendInteractiveListRequest.Row> rows = patients.stream()
                 .limit(10)
                 .map(patient -> new SendInteractiveListRequest.Row(
-                        UPD_PAT_PREFIX + patient.getPatientUUID(),
-                        truncate(patient.getPatientName(), 24),
-                        "Edad: " + (patient.getPatientAge() != null
-                                ? patient.getPatientAge() : "N/A")))
+                        PATIENT_PREFIX + patient.getPatientUUID(),
+                        truncate(fullName(patient), 24),
+                        truncate("Tel: " + nullSafe(patient.getPatientPhone())
+                                + " | Edad: " + ageLabel(patient), 72)))
                 .toList();
 
         whatsAppClient.sendInteractiveList(doctorPhone,
-                "Seleccione el paciente a actualizar", "Ver Pacientes", rows);
-
-        WhatsAppSession doctorSession =
-                getOrCreateDoctorSession(getOrCreateDoctorContact(doctorPhone));
-        setDoctorState(doctorSession, SessionState.DOC_UPD_SELECTING_PATIENT);
+                "Seleccione el paciente que desea actualizar", "Ver Pacientes", rows);
+        if (patients.size() > 10) {
+            whatsAppClient.sendTextMessage(doctorPhone,
+                    "Hay más de 10 resultados. Refine la búsqueda para ver el paciente correcto.");
+        }
     }
 
-    private boolean handleUpdatePatientSelected(String doctorPhone,
-                                                WhatsAppSession session,
-                                                String selectedOptionId) {
-        UUID patientUUID;
+    private void handleUpdatePatientSelection(String doctorPhone, DoctorSession session,
+                                              String selectedOptionId) {
+        if (selectedOptionId == null || !selectedOptionId.startsWith(PATIENT_PREFIX)) {
+            whatsAppClient.sendTextMessage(doctorPhone, "Seleccione un paciente de la lista.");
+            return;
+        }
+
+        UUID patientId;
         try {
-            patientUUID = UUID.fromString(
-                    selectedOptionId.substring(UPD_PAT_PREFIX.length()));
+            patientId = UUID.fromString(selectedOptionId.substring(PATIENT_PREFIX.length()));
         } catch (IllegalArgumentException e) {
             whatsAppClient.sendTextMessage(doctorPhone, "Paciente inválido.");
-            return true;
+            return;
         }
 
-        Optional<Patient> patientOpt = patientRepository.findById(patientUUID);
-        if (patientOpt.isEmpty()) {
+        if (patientRepository.findById(patientId).isEmpty()) {
             whatsAppClient.sendTextMessage(doctorPhone, "Paciente no encontrado.");
-            return true;
+            return;
         }
 
-        Optional<Appointment> appointmentOpt = appointmentRepository
-                .findTopByPatientAppointment_PatientUUIDOrderByCreatedAtDesc(patientUUID);
-        if (appointmentOpt.isEmpty()) {
+        session.selectedPatientId = patientId;
+        proceedAfterPatientSelected(doctorPhone, session);
+    }
+
+    private void proceedAfterPatientSelected(String doctorPhone, DoctorSession session) {
+        Patient patient = patientRepository.findById(session.selectedPatientId).orElse(null);
+        if (patient == null) {
+            whatsAppClient.sendTextMessage(doctorPhone, "Paciente no encontrado.");
+            resetDoctorSession(session);
+            return;
+        }
+
+        if (session.updateTarget == UpdateTarget.CITA) {
+            List<Appointment> appointments = sortedAppointments(
+                    appointmentRepository.findByPatientAppointment_PatientUUID(patient.getPatientUUID()));
+
+            if (appointments.isEmpty()) {
+                whatsAppClient.sendTextMessage(doctorPhone,
+                        "El paciente *" + fullName(patient) + "* no tiene citas registradas.");
+                resetDoctorSession(session);
+                return;
+            }
+
+            session.appointmentCandidates = appointments.stream()
+                    .map(Appointment::getAppointmentId)
+                    .collect(Collectors.toCollection(ArrayList::new));
+
+            if (appointments.size() == 1) {
+                session.selectedAppointmentId = appointments.get(0).getAppointmentId();
+                showUpdateFieldList(doctorPhone, session);
+            } else {
+                sendAppointmentSelectionList(doctorPhone, appointments);
+                session.state = DoctorState.UPDATE_AWAITING_APPOINTMENT_SELECTION;
+            }
+        } else {
+            showUpdateFieldList(doctorPhone, session);
+        }
+    }
+
+    private void sendAppointmentSelectionList(String doctorPhone, List<Appointment> appointments) {
+        List<SendInteractiveListRequest.Row> rows = appointments.stream()
+                .limit(10)
+                .map(appointment -> new SendInteractiveListRequest.Row(
+                        APPOINTMENT_PREFIX + appointment.getAppointmentId(),
+                        truncate(formatDateTimeShort(appointment), 24),
+                        truncate(appointmentSummary(appointment), 72)))
+                .toList();
+
+        whatsAppClient.sendInteractiveList(doctorPhone,
+                "Seleccione la cita que desea actualizar", "Ver Citas", rows);
+        if (appointments.size() > 10) {
             whatsAppClient.sendTextMessage(doctorPhone,
-                    "Ese paciente no tiene una cita para actualizar.");
-            return true;
+                    "Hay más de 10 citas. Refine la búsqueda para ver la cita correcta.");
+        }
+    }
+
+    private void handleUpdateAppointmentSelection(String doctorPhone, DoctorSession session,
+                                                  String selectedOptionId) {
+        if (selectedOptionId == null || !selectedOptionId.startsWith(APPOINTMENT_PREFIX)) {
+            whatsAppClient.sendTextMessage(doctorPhone, "Seleccione una cita de la lista.");
+            return;
         }
 
-        sendDoctorUpdateAppointmentFlow(
-                doctorPhone, patientOpt.get(), appointmentOpt.get());
-        resetDoctorFlow(session);
-        return true;
+        UUID appointmentId;
+        try {
+            appointmentId = UUID.fromString(selectedOptionId.substring(APPOINTMENT_PREFIX.length()));
+        } catch (IllegalArgumentException e) {
+            whatsAppClient.sendTextMessage(doctorPhone, "Cita inválida.");
+            return;
+        }
+
+        if (appointmentRepository.findById(appointmentId).isEmpty()) {
+            whatsAppClient.sendTextMessage(doctorPhone, "Cita no encontrada.");
+            return;
+        }
+
+        session.selectedAppointmentId = appointmentId;
+        showUpdateFieldList(doctorPhone, session);
+    }
+
+    private void showUpdateFieldList(String doctorPhone, DoctorSession session) {
+        Patient patient = patientRepository.findById(session.selectedPatientId).orElse(null);
+        if (patient == null) {
+            whatsAppClient.sendTextMessage(doctorPhone, "Paciente no encontrado.");
+            resetDoctorSession(session);
+            return;
+        }
+
+        Appointment appointment = null;
+        if (session.updateTarget == UpdateTarget.CITA) {
+            appointment = appointmentRepository.findById(session.selectedAppointmentId).orElse(null);
+            if (appointment == null) {
+                whatsAppClient.sendTextMessage(doctorPhone, "Cita no encontrada.");
+                resetDoctorSession(session);
+                return;
+            }
+        }
+
+        List<SendInteractiveListRequest.Row> rows =
+                buildUpdateFieldRows(patient, appointment, session.updateTarget);
+        whatsAppClient.sendInteractiveList(doctorPhone,
+                "¿Qué desearía cambiar?", "Ver Campos", rows);
+        session.state = DoctorState.UPDATE_AWAITING_FIELD_SELECTION;
+    }
+
+    private List<SendInteractiveListRequest.Row> buildUpdateFieldRows(Patient patient,
+                                                                      Appointment appointment,
+                                                                      UpdateTarget target) {
+        return validFields(target).stream()
+                .map(field -> new SendInteractiveListRequest.Row(
+                        FIELD_PREFIX + field,
+                        truncate(fieldLabel(field), 24),
+                        truncate("Actual: " + currentFieldValue(patient, appointment, field), 72)))
+                .toList();
+    }
+
+    private List<String> validFields(UpdateTarget target) {
+        return target == UpdateTarget.PATIENT
+                ? List.of("patientName", "patientLastname", "patientPhone", "patientAge",
+                          "patientState", "patientPaymentState")
+                : List.of("patientAppointment", "dentistAppointment", "treatments", "category",
+                          "appointmentStatus", "notes", "appointmentDateTime", "paymentMethod");
+    }
+
+    private void handleUpdateFieldSelection(String doctorPhone, DoctorSession session,
+                                            String selectedOptionId) {
+        if (selectedOptionId == null || !selectedOptionId.startsWith(FIELD_PREFIX)) {
+            whatsAppClient.sendTextMessage(doctorPhone, "Seleccione un campo de la lista.");
+            return;
+        }
+
+        String field = selectedOptionId.substring(FIELD_PREFIX.length());
+        if (!validFields(session.updateTarget).contains(field)) {
+            whatsAppClient.sendTextMessage(doctorPhone,
+                    "Ese campo no es válido para esta actualización.");
+            return;
+        }
+
+        session.selectedField = field;
+        session.state = DoctorState.UPDATE_AWAITING_NEW_VALUE;
+        whatsAppClient.sendTextMessage(doctorPhone,
+                "Escriba el nuevo " + fieldPromptLabel(field) + " que desea poner:");
+    }
+
+    private void handleUpdateNewValue(String doctorPhone, DoctorSession session, String message) {
+        try {
+            Object value = parseFieldValue(session.selectedField, message);
+            session.pendingChanges.put(canonicalField(session.selectedField), value);
+        } catch (IllegalArgumentException e) {
+            whatsAppClient.sendTextMessage(doctorPhone,
+                    e.getMessage() + "\nEscriba el nuevo "
+                            + fieldPromptLabel(session.selectedField) + " que desea poner:");
+            return;
+        }
+
+        session.state = DoctorState.UPDATE_AWAITING_CONFIRM;
+        sendYesNoConfirmation(doctorPhone);
+    }
+
+    private void sendYesNoConfirmation(String doctorPhone) {
+        whatsAppClient.sendInteractiveButtons(doctorPhone,
+                "Eso es todo lo que desea cambiar de este paciente?",
+                List.of(
+                        SendInteractiveButtonRequest.replyButton(CONFIRM_YES, "SI"),
+                        SendInteractiveButtonRequest.replyButton(CONFIRM_NO, "NO")
+                ));
+    }
+
+    private void handleUpdateConfirmation(String doctorPhone, DoctorSession session,
+                                          String selectedOptionId, String message) {
+        String choice = selectedOptionId;
+        if (choice == null) {
+            String normalized = normalize(message);
+            if (normalized.equals("si")) {
+                choice = CONFIRM_YES;
+            } else if (normalized.equals("no")) {
+                choice = CONFIRM_NO;
+            }
+        }
+
+        if (CONFIRM_NO.equals(choice)) {
+            session.state = DoctorState.UPDATE_AWAITING_FIELD_SELECTION;
+            showUpdateFieldList(doctorPhone, session);
+            return;
+        }
+
+        if (CONFIRM_YES.equals(choice)) {
+            applyPendingChanges(session);
+            whatsAppClient.sendTextMessage(doctorPhone, UPDATED_MESSAGE);
+            resetDoctorSession(session);
+            return;
+        }
+
+        sendYesNoConfirmation(doctorPhone);
+    }
+
+    private void applyPendingChanges(DoctorSession session) {
+        Patient patient = patientRepository.findById(session.selectedPatientId).orElse(null);
+        if (patient == null) {
+            log.warn("Cannot apply changes: patient {} not found", session.selectedPatientId);
+            return;
+        }
+
+        Appointment appointment = session.selectedAppointmentId == null ? null
+                : appointmentRepository.findById(session.selectedAppointmentId).orElse(null);
+
+        for (Map.Entry<String, Object> entry : session.pendingChanges.entrySet()) {
+            String field = entry.getKey();
+            Object value = entry.getValue();
+
+            switch (field) {
+                case "patientName" -> patient.setPatientName((String) value);
+                case "patientLastname" -> patient.setPatientLastname((String) value);
+                case "patientPhone" -> patient.setPatientPhone((String) value);
+                case "patientAge" -> patient.setPatientAge((Integer) value);
+                case "patientState" -> patient.setPatientState((PatientState) value);
+                case "patientPaymentState" ->
+                        patient.setPatientPaymentState((PatientPaymentState) value);
+                case "dentistAppointment" -> {
+                    if (appointment != null) {
+                        dentistRepository.findById((UUID) value)
+                                .ifPresent(appointment::setDentistAppointment);
+                    }
+                }
+                case "treatments" -> {
+                    if (appointment != null) {
+                        treatmentsRepository.findById((Long) value)
+                                .ifPresent(treatment ->
+                                        appointment.setTreatments(List.of(treatment)));
+                    }
+                }
+                case "category" -> {
+                    if (appointment != null) {
+                        appointment.setCategory((String) value);
+                    }
+                }
+                case "appointmentStatus" -> {
+                    if (appointment != null) {
+                        appointment.setAppointmentStatus((String) value);
+                    }
+                }
+                case "notes" -> {
+                    if (appointment != null) {
+                        appointment.setNotes((String) value);
+                    }
+                }
+                case "paymentMethod" -> {
+                    if (appointment != null) {
+                        appointment.setPaymentMethod((PaymentMethod) value);
+                    }
+                }
+                case "appointmentDateTime" -> {
+                    if (appointment != null) {
+                        LocalDateTime dateTime = (LocalDateTime) value;
+                        appointment.setAppointmentDateTime(dateTime);
+                        appointment.setStartAppointmentAt(Timestamp.valueOf(dateTime));
+                    }
+                }
+                default -> log.warn("Unknown pending change field: {}", field);
+            }
+        }
+
+        patientRepository.save(patient);
+        if (appointment != null) {
+            appointmentRepository.save(appointment);
+        }
+    }
+
+    private Object parseFieldValue(String field, String raw) {
+        String value = raw == null ? "" : raw.trim();
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("El valor no puede estar vacío.");
+        }
+
+        return switch (canonicalField(field)) {
+            case "patientName", "patientLastname", "patientPhone", "category", "notes" -> value;
+            case "patientAge" -> parseAge(value);
+            case "patientState" -> parsePatientState(value);
+            case "patientPaymentState" -> parsePatientPaymentState(value);
+            case "appointmentDateTime" -> parseRequiredDateTime(value);
+            case "dentistAppointment" -> resolveDentistId(value);
+            case "treatments" -> resolveTreatmentId(value);
+            case "appointmentStatus" -> parseAppointmentStatus(value);
+            case "paymentMethod" -> parsePaymentMethod(value);
+            default -> throw new IllegalArgumentException("Campo desconocido.");
+        };
+    }
+
+    private Integer parseAge(String value) {
+        try {
+            int age = Integer.parseInt(value);
+            if (age < 0 || age > 120) {
+                throw new IllegalArgumentException("La edad debe estar entre 0 y 120.");
+            }
+            return age;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("La edad debe ser un número.");
+        }
+    }
+
+    private PatientState parsePatientState(String value) {
+        String normalized = normalize(value);
+        if (normalized.contains("por definir") || normalized.equals("undefined")) {
+            return PatientState.UNDEFINED;
+        }
+        if (normalized.contains("seguimiento") || normalized.equals("on tracking")
+                || normalized.equals("on_tracking")) {
+            return PatientState.ON_TRACKING;
+        }
+        if (normalized.contains("cerrado") || normalized.equals("closed")) {
+            return PatientState.CLOSED;
+        }
+        throw new IllegalArgumentException(
+                "Estado inválido. Use: POR DEFINIR, EN SEGUIMIENTO o CERRADO.");
+    }
+
+    private PatientPaymentState parsePatientPaymentState(String value) {
+        String normalized = normalize(value);
+        if (normalized.contains("completo") || normalized.equals("complete")) {
+            return PatientPaymentState.COMPLETE;
+        }
+        if (normalized.contains("parcial") || normalized.equals("partially")) {
+            return PatientPaymentState.PARTIALLY;
+        }
+        if (normalized.contains("deuda") || normalized.equals("in debt")
+                || normalized.equals("in_debt")) {
+            return PatientPaymentState.IN_DEBT;
+        }
+        if (normalized.contains("por definir") || normalized.equals("undefined price")) {
+            return PatientPaymentState.UNDEFINED_PRICE;
+        }
+        throw new IllegalArgumentException(
+                "Estado de pago inválido. Use: COMPLETO, PARCIALMENTE, EN DEUDA o POR DEFINIR.");
+    }
+
+    private String parseAppointmentStatus(String value) {
+        String normalized = normalize(value);
+        if (normalized.contains("pendiente") || normalized.equals("pending")) {
+            return "PENDING";
+        }
+        if (normalized.contains("confirmada") || normalized.contains("confirmado")
+                || normalized.equals("confirmed")) {
+            return "CONFIRMED";
+        }
+        if (normalized.contains("cancelada") || normalized.contains("cancelado")
+                || normalized.equals("cancelled") || normalized.equals("canceled")) {
+            return "CANCELLED";
+        }
+        if (normalized.contains("completada") || normalized.contains("completado")
+                || normalized.equals("completed")) {
+            return "COMPLETED";
+        }
+        return value.toUpperCase(Locale.ROOT);
+    }
+
+    private PaymentMethod parsePaymentMethod(String value) {
+        String normalized = normalize(value);
+        if (normalized.contains("efectivo") || normalized.equals("cash")) {
+            return PaymentMethod.CASH;
+        }
+        if (normalized.contains("transferencia") || normalized.equals("transfer")) {
+            return PaymentMethod.TRANSFER;
+        }
+        throw new IllegalArgumentException(
+                "Método de pago inválido. Use: EFECTIVO o TRANSFERENCIA.");
+    }
+
+    private UUID resolveDentistId(String value) {
+        String query = normalize(value);
+        return dentistRepository.findAll().stream()
+                .filter(dentist -> normalize(fullDentistName(dentist)).contains(query)
+                        || normalize(nullSafe(dentist.getDentistName())).contains(query)
+                        || normalize(nullSafe(dentist.getDentistLastname())).contains(query))
+                .findFirst()
+                .map(Dentist::getDentistUUID)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No encontré un dentista con ese nombre."));
+    }
+
+    private Long resolveTreatmentId(String value) {
+        String query = normalize(value);
+        List<Treatments> treatments = treatmentsRepository.findAll();
+
+        return treatments.stream()
+                .filter(treatment -> normalize(treatment.getTreatment()).equals(query))
+                .findFirst()
+                .or(() -> treatments.stream()
+                        .filter(treatment -> normalize(treatment.getTreatment()).contains(query))
+                        .findFirst())
+                .map(Treatments::getId)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No encontré un tratamiento con ese nombre."));
+    }
+
+    private String canonicalField(String field) {
+        return "patientAppointment".equals(field) ? "appointmentDateTime" : field;
+    }
+
+    private String fieldLabel(String field) {
+        return switch (field) {
+            case "patientName" -> "Nombre";
+            case "patientLastname" -> "Apellido";
+            case "patientPhone" -> "Teléfono";
+            case "patientAge" -> "Edad";
+            case "patientState" -> "Estado del paciente";
+            case "patientPaymentState" -> "Estado de pago";
+            case "patientAppointment" -> "Fecha/Hora de la cita";
+            case "dentistAppointment" -> "Dentista";
+            case "treatments" -> "Tratamiento";
+            case "category" -> "Categoría";
+            case "appointmentStatus" -> "Estado de la cita";
+            case "notes" -> "Notas";
+            case "appointmentDateTime" -> "Fecha/Hora de la cita (detalle)";
+            case "paymentMethod" -> "Método de pago";
+            default -> field;
+        };
+    }
+
+    private String fieldPromptLabel(String field) {
+        return fieldLabel(field).toLowerCase(Locale.ROOT);
+    }
+
+    private String currentFieldValue(Patient patient, Appointment appointment, String field) {
+        return switch (field) {
+            case "patientName" -> nullSafe(patient.getPatientName());
+            case "patientLastname" -> nullSafe(patient.getPatientLastname());
+            case "patientPhone" -> nullSafe(patient.getPatientPhone());
+            case "patientAge" -> ageLabel(patient);
+            case "patientState" -> patientStateLabel(patient);
+            case "patientPaymentState" -> patientPaymentStateLabel(patient);
+            case "patientAppointment", "appointmentDateTime" ->
+                    appointment == null ? "Sin cita" : formatDateTimeShort(appointment);
+            case "dentistAppointment" ->
+                    appointment == null ? "Sin cita" : dentistName(appointment);
+            case "treatments" ->
+                    appointment == null ? "Sin cita" : treatmentLabel(appointment);
+            case "category" ->
+                    appointment == null ? "Sin cita" : nullSafe(appointment.getCategory());
+            case "appointmentStatus" ->
+                    appointment == null ? "Sin cita" : nullSafe(appointment.getAppointmentStatus());
+            case "notes" ->
+                    appointment == null ? "Sin cita" : nullSafe(appointment.getNotes());
+            case "paymentMethod" ->
+                    appointment == null ? "Sin cita" : paymentMethodLabel(appointment);
+            default -> "";
+        };
+    }
+
+    private SearchOutcome searchPatientsAndAppointments(String query) {
+        String normalizedQuery = normalize(query);
+        LocalDate dateQuery = parseSearchDate(query);
+
+        List<Patient> allPatients = patientRepository.findAll();
+        List<Appointment> allAppointments = appointmentRepository.findAll();
+
+        Set<UUID> matchedPatientIds = new LinkedHashSet<>();
+        for (Patient patient : allPatients) {
+            if (matchesPatient(patient, normalizedQuery)) {
+                matchedPatientIds.add(patient.getPatientUUID());
+            }
+        }
+        for (Appointment appointment : allAppointments) {
+            Patient patient = appointment.getPatientAppointment();
+            if (patient == null) {
+                continue;
+            }
+            if ((dateQuery != null && matchesDate(appointment, dateQuery))
+                    || matchesTreatment(appointment, normalizedQuery)) {
+                matchedPatientIds.add(patient.getPatientUUID());
+            }
+        }
+
+        List<Patient> patients = allPatients.stream()
+                .filter(patient -> matchedPatientIds.contains(patient.getPatientUUID()))
+                .sorted(Comparator.comparing(patient -> normalize(fullName(patient))))
+                .toList();
+
+        Map<UUID, List<Appointment>> appointmentsByPatient = new LinkedHashMap<>();
+        for (Patient patient : patients) {
+            List<Appointment> appointments = sortedAppointments(
+                    allAppointments.stream()
+                            .filter(appointment -> appointment.getPatientAppointment() != null
+                                    && patient.getPatientUUID().equals(
+                                            appointment.getPatientAppointment().getPatientUUID()))
+                            .toList());
+            appointmentsByPatient.put(patient.getPatientUUID(), appointments);
+        }
+
+        return new SearchOutcome(patients, appointmentsByPatient);
+    }
+
+    private boolean matchesPatient(Patient patient, String query) {
+        if (query.isBlank()) {
+            return false;
+        }
+        return normalize(fullName(patient)).contains(query)
+                || normalize(nullSafe(patient.getPatientName())).contains(query)
+                || normalize(nullSafe(patient.getPatientLastname())).contains(query)
+                || normalize(nullSafe(patient.getPatientPhone())).contains(query);
+    }
+
+    private boolean matchesDate(Appointment appointment, LocalDate date) {
+        if (appointment.getStartAppointmentAt() != null
+                && appointment.getStartAppointmentAt().toLocalDateTime().toLocalDate().equals(date)) {
+            return true;
+        }
+        return appointment.getAppointmentDateTime() != null
+                && appointment.getAppointmentDateTime().toLocalDate().equals(date);
+    }
+
+    private boolean matchesTreatment(Appointment appointment, String query) {
+        if (query.isBlank() || appointment.getTreatments() == null) {
+            return false;
+        }
+        for (Treatments treatment : appointment.getTreatments()) {
+            if (treatment.getTreatment() != null
+                    && normalize(treatment.getTreatment()).contains(query)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<Appointment> sortedAppointments(List<Appointment> appointments) {
+        return appointments.stream()
+                .sorted(Comparator.comparing(
+                        Appointment::getStartAppointmentAt,
+                        Comparator.nullsLast(Comparator.reverseOrder())))
+                .toList();
+    }
+
+    private void showPatientDetails(String doctorPhone, Patient patient,
+                                    List<Appointment> appointments) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("*Paciente:* ").append(fullName(patient)).append("\n");
+        sb.append("Teléfono: ").append(nullSafe(patient.getPatientPhone())).append("\n");
+        sb.append("Edad: ").append(ageLabel(patient)).append("\n");
+        sb.append("Estado: ").append(patientStateLabel(patient)).append("\n");
+        sb.append("Pago: ").append(patientPaymentStateLabel(patient)).append("\n\n");
+        sb.append("*Citas:*\n");
+
+        if (appointments.isEmpty()) {
+            sb.append("Sin citas registradas.");
+        } else {
+            int index = 1;
+            for (Appointment appointment : appointments.stream().limit(10).toList()) {
+                sb.append(index++).append(". ").append(appointmentSummary(appointment)).append("\n");
+            }
+            if (appointments.size() > 10) {
+                sb.append("... y ").append(appointments.size() - 10).append(" cita(s) más.\n");
+            }
+        }
+
+        whatsAppClient.sendTextMessage(doctorPhone, sb.toString().trim());
+    }
+
+    private void sendSearchResultsList(String doctorPhone, SearchOutcome outcome) {
+        StringBuilder sb = new StringBuilder("*Resultados:*\n\n");
+        int index = 1;
+
+        for (Patient patient : outcome.patients()) {
+            if (index > 10) {
+                sb.append("... y ").append(outcome.patients().size() - 10)
+                        .append(" paciente(s) más. Refine la búsqueda.\n");
+                break;
+            }
+
+            List<Appointment> appointments = outcome.appointmentsByPatient()
+                    .getOrDefault(patient.getPatientUUID(), List.of());
+
+            sb.append(index++).append(". *").append(fullName(patient)).append("*\n");
+            sb.append("   Tel: ").append(nullSafe(patient.getPatientPhone()))
+                    .append(" | Edad: ").append(ageLabel(patient)).append("\n");
+            sb.append("   Estado: ").append(patientStateLabel(patient))
+                    .append(" | Pago: ").append(patientPaymentStateLabel(patient)).append("\n");
+
+            if (appointments.isEmpty()) {
+                sb.append("   Cita: Sin citas registradas.\n");
+            } else {
+                sb.append("   Cita: ").append(formatDateTimeShort(appointments.get(0)))
+                        .append(" — ").append(treatmentLabel(appointments.get(0))).append("\n");
+            }
+            sb.append("\n");
+        }
+
+        whatsAppClient.sendTextMessage(doctorPhone, sb.toString().trim());
+    }
+
+    private void showPatientsPage(String doctorPhone, int pageNumber) {
+        int pageSize = 10;
+        Page<Patient> page = patientRepository.findAll(
+                PageRequest.of(pageNumber, pageSize,
+                        Sort.by(Sort.Direction.ASC, "patientName")));
+
+        if (page.isEmpty()) {
+            whatsAppClient.sendTextMessage(doctorPhone, "No se encontraron pacientes registrados.");
+            return;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("*Pacientes (Página ").append(pageNumber + 1)
+                .append(" de ").append(page.getTotalPages()).append(")*:\n\n");
+
+        int index = pageNumber * pageSize + 1;
+        for (Patient patient : page.getContent()) {
+            sb.append(index++).append(". *").append(fullName(patient)).append("*\n");
+            sb.append("   Tel: ").append(nullSafe(patient.getPatientPhone()))
+                    .append(" | Edad: ").append(ageLabel(patient)).append("\n");
+            sb.append("   Estado: ").append(patientStateLabel(patient))
+                    .append(" | Pago: ").append(patientPaymentStateLabel(patient)).append("\n\n");
+        }
+
+        if (page.hasNext()) {
+            whatsAppClient.sendInteractiveButton(doctorPhone, sb.toString().trim(),
+                    "Ver más pacientes", PATIENTS_PAGE_PREFIX + (pageNumber + 1));
+        } else {
+            sb.append("🏁 _Fin del listado de pacientes._");
+            whatsAppClient.sendTextMessage(doctorPhone, sb.toString().trim());
+        }
+    }
+
+    private String appointmentSummary(Appointment appointment) {
+        return "Tratamiento: " + treatmentLabel(appointment)
+                + ". Fecha: " + formatDate(appointment)
+                + ". Hora: " + formatTime(appointment)
+                + ". Dentista: " + dentistName(appointment)
+                + ". Estado: " + nullSafe(appointment.getAppointmentStatus())
+                + ". Pago: " + paymentMethodLabel(appointment);
+    }
+
+    private String formatDateTimeShort(Appointment appointment) {
+        if (appointment.getStartAppointmentAt() != null) {
+            return new SimpleDateFormat("dd/MM/yyyy hh:mma")
+                    .format(appointment.getStartAppointmentAt());
+        }
+        if (appointment.getAppointmentDateTime() != null) {
+            return appointment.getAppointmentDateTime()
+                    .format(DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm"));
+        }
+        return "Sin fecha";
+    }
+
+    private String formatDate(Appointment appointment) {
+        if (appointment.getStartAppointmentAt() != null) {
+            return new SimpleDateFormat("dd/MM/yyyy").format(appointment.getStartAppointmentAt());
+        }
+        if (appointment.getAppointmentDateTime() != null) {
+            return appointment.getAppointmentDateTime().toLocalDate().toString();
+        }
+        return "Por definir";
+    }
+
+    private String formatTime(Appointment appointment) {
+        if (appointment.getStartAppointmentAt() != null) {
+            return new SimpleDateFormat("hh:mma")
+                    .format(appointment.getStartAppointmentAt()).toLowerCase(Locale.ROOT);
+        }
+        if (appointment.getAppointmentDateTime() != null) {
+            return appointment.getAppointmentDateTime().toLocalTime().toString();
+        }
+        return "Por definir";
+    }
+
+    private String treatmentLabel(Appointment appointment) {
+        if (appointment.getTreatments() == null || appointment.getTreatments().isEmpty()) {
+            return "Consulta general";
+        }
+        return appointment.getTreatments().stream()
+                .map(Treatments::getTreatment)
+                .collect(Collectors.joining(" & "));
+    }
+
+    private String dentistName(Appointment appointment) {
+        return appointment.getDentistAppointment() == null
+                ? "Por definir"
+                : fullDentistName(appointment.getDentistAppointment());
+    }
+
+    private String fullDentistName(Dentist dentist) {
+        String full = (nullSafe(dentist.getDentistName()) + " "
+                + nullSafe(dentist.getDentistLastname())).trim();
+        return full.isBlank() ? "Sin nombre" : full;
+    }
+
+    private String paymentMethodLabel(Appointment appointment) {
+        return appointment.getPaymentMethod() != null
+                ? appointment.getPaymentMethod().getPaymentMethod()
+                : "Por definir";
+    }
+
+    private String ageLabel(Patient patient) {
+        return patient.getPatientAge() == null ? "N/A" : String.valueOf(patient.getPatientAge());
+    }
+
+    private String patientStateLabel(Patient patient) {
+        return patient.getPatientState() != null
+                ? patient.getPatientState().getPatientState()
+                : PatientState.UNDEFINED.getPatientState();
+    }
+
+    private String patientPaymentStateLabel(Patient patient) {
+        return patient.getPatientPaymentState() != null
+                ? patient.getPatientPaymentState().getPatientPaymentState()
+                : PatientPaymentState.UNDEFINED_PRICE.getPatientPaymentState();
+    }
+
+    private String fullName(Patient patient) {
+        String full = (nullSafe(patient.getPatientName()) + " "
+                + nullSafe(patient.getPatientLastname())).trim();
+        return full.isBlank() ? "Sin nombre" : full;
+    }
+
+    private String nullSafe(String value) {
+        return value == null ? "" : value.trim();
+    }
+
+    private String normalize(String value) {
+        if (value == null) {
+            return "";
+        }
+        return Normalizer.normalize(value, Normalizer.Form.NFD)
+                .replaceAll("\\p{M}", "")
+                .toLowerCase(Locale.ROOT)
+                .trim();
     }
 
     private String truncate(String value, int maxLength) {
@@ -895,199 +1468,79 @@ public class WhatsAppBotService {
         return value.length() <= maxLength ? value : value.substring(0, maxLength);
     }
 
-    private Timestamp startOfDay(LocalDate date) {
-        return Timestamp.valueOf(date.atStartOfDay());
-    }
+    private static final List<DateTimeFormatter> DATE_TIME_FORMATTERS = List.of(
+            DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm"),
+            DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm"),
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"),
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm"),
+            DateTimeFormatter.ofPattern("dd/MM/yyyy hh:mma", Locale.ENGLISH),
+            DateTimeFormatter.ofPattern("dd/MM/yyyy hh:mm a", Locale.ENGLISH),
+            DateTimeFormatter.ofPattern("dd/MM/yyyy h:mm a", Locale.ENGLISH)
+    );
 
-    private Timestamp startOfNextDay(LocalDate date) {
-        return Timestamp.valueOf(date.plusDays(1).atStartOfDay());
-    }
+    private static final List<DateTimeFormatter> DATE_FORMATTERS = List.of(
+            DateTimeFormatter.ofPattern("dd/MM/yyyy"),
+            DateTimeFormatter.ofPattern("dd-MM-yyyy"),
+            DateTimeFormatter.ofPattern("yyyy-MM-dd")
+    );
 
-    private String formatAppointment(LocalDateTime dateTime) {
-        return dateTime.format(DateTimeFormatter.ofPattern(
-                "dd/MM/yyyy 'a las' hh:mma", Locale.of("es", "ES")));
-    }
+    private LocalDateTime parseDateTime(String value) {
+        String text = value == null ? "" : value.trim();
 
-    private String asString(Object value) {
-        return value == null ? null : String.valueOf(value).trim();
-    }
-
-    private Integer asInteger(Object value) {
-        if (value instanceof Number number) {
-            return number.intValue();
+        for (DateTimeFormatter formatter : DATE_TIME_FORMATTERS) {
+            try {
+                return LocalDateTime.parse(text, formatter);
+            } catch (DateTimeParseException ignored) {
+            }
         }
-        if (value == null) {
+        for (DateTimeFormatter formatter : DATE_FORMATTERS) {
+            try {
+                return LocalDate.parse(text, formatter).atTime(10, 0);
+            } catch (DateTimeParseException ignored) {
+            }
+        }
+        return parsedDoctorCustomizedDate(text);
+    }
+
+    private LocalDateTime parseRequiredDateTime(String value) {
+        LocalDateTime parsed = parseDateTime(value);
+        if (parsed == null) {
+            throw new IllegalArgumentException(
+                    "Fecha inválida. Use el formato dd/MM/yyyy HH:mm.");
+        }
+        return parsed;
+    }
+
+    private LocalDate parseSearchDate(String value) {
+        String text = value == null ? "" : value.trim();
+
+        for (DateTimeFormatter formatter : DATE_FORMATTERS) {
+            try {
+                return LocalDate.parse(text, formatter);
+            } catch (DateTimeParseException ignored) {
+            }
+        }
+        for (DateTimeFormatter formatter : DATE_TIME_FORMATTERS) {
+            try {
+                return LocalDateTime.parse(text, formatter).toLocalDate();
+            } catch (DateTimeParseException ignored) {
+            }
+        }
+
+        if (!looksLikeDate(text)) {
             return null;
         }
-        try {
-            return Integer.parseInt(String.valueOf(value).trim());
-        } catch (NumberFormatException e) {
-            return null;
-        }
+        LocalDateTime natural = parsedDoctorCustomizedDate(text);
+        return natural != null ? natural.toLocalDate() : null;
     }
 
-    private LocalDate asLocalDate(Object value) {
-        if (value == null) {
-            return null;
-        }
-        try {
-            return LocalDate.parse(String.valueOf(value).trim());
-        } catch (DateTimeException e) {
-            return null;
-        }
-    }
-
-    private LocalTime asLocalTime(Object value) {
-        if (value == null) {
-            return null;
-        }
-        try {
-            return LocalTime.parse(String.valueOf(value).trim());
-        } catch (DateTimeException e) {
-            return null;
-        }
-    }
-
-    private boolean sendTreatmentList(String doctorPhone) {
-        List<Treatments> treatments = treatmentsRepository.findAll();
-        if (treatments.isEmpty()) {
-            whatsAppClient.sendTextMessage(doctorPhone, "No hay tratamientos registrados en el sistema :(");
+    private boolean looksLikeDate(String text) {
+        String normalized = normalize(text);
+        if (normalized.contains("/")) {
             return true;
         }
-
-        List<SendInteractiveListRequest.Row> treatmentRows = treatments.stream()
-                .limit(10) // Meta allows a maximum of 10 rows per interactive menu
-                .map(t -> new SendInteractiveListRequest.Row(
-                        "TREAT_" + t.getId(),
-                        t.getTreatment(),
-                        "Precio: $" + t.getPrice()))
-                .toList();
-
-        whatsAppClient.sendInteractiveList(doctorPhone,
-                "Doctor, por favor seleccione el tratamiento que recibió el paciente:",
-                "Ver Tratamientos", treatmentRows);
-        log.info("Dispatched interactive treatment list to Doctor ({})", doctorPhone);
-        return true;
-    }
-
-    /** Confirms the date of an appointment created by the patient intake flow. */
-    private boolean handlePatientDateConfirmation(String doctorPhone, WhatsAppSession session, String messageBody) {
-        LocalDate customDate = parsedDoctorCustomizedDate(messageBody);
-        if (customDate == null) {
-            whatsAppClient.sendTextMessage(doctorPhone,
-                    "No logré reconocer la fecha. Indíquela como *día de mes hora* " +
-                            "(Ejemplo: *24 de noviembre 10:00am*).");
-            return true;
-        }
-        LocalTime customTime = parsedDoctorCustomizedTime(messageBody);
-        LocalDateTime customDateTime = LocalDateTime.of(customDate, customTime);
-
-        Optional<Appointment> pending =
-                appointmentRepository.findTopByAppointmentStatusOrderByCreatedAtDesc("PENDING");
-        if (pending.isEmpty()) {
-            resetDoctorFlow(session);
-            whatsAppClient.sendTextMessage(doctorPhone, "No hay citas pendientes por confirmar.");
-            return true;
-        }
-
-        Appointment appointment = pending.get();
-        appointment.setStartAppointmentAt(Timestamp.valueOf(customDateTime));
-        appointment.setAppointmentStatus("CONFIRMED");
-        appointmentRepository.save(appointment);
-        resetDoctorFlow(session);
-
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern(
-                "dd/MM/yyyy 'a las' hh:mma", Locale.of("es", "ES"));
-        String formattedDate = customDate.format(formatter);
-        whatsAppClient.sendTextMessage(doctorPhone,
-                "✅ Cita confirmada con éxito para el *" + formattedDate + "*.");
-
-        if (appointment.getPatientAppointment() != null
-                && appointment.getPatientAppointment().getPatientPhone() != null) {
-            whatsAppClient.sendTextMessage(
-                    appointment.getPatientAppointment().getPatientPhone(),
-                    "¡Hola! El doctor ha confirmado tu cita para el *" + formattedDate +
-                            "*. Te esperamos en la clínica.");
-        }
-        return true;
-    }
-
-    // ===================================================================================
-    // SESSION HELPERS
-    // ===================================================================================
-
-    private WhatsAppSession getOrCreateDoctorSession(WhatsAppContact contact) {
-        return sessionRepository.findByWhatsAppContact_WaUserId(contact.getWaUserId())
-                .orElseGet(() -> {
-                    WhatsAppSession session = new WhatsAppSession();
-                    session.setWhatsAppContact(contact);
-                    session.setCurrentState(SessionState.DOC_IDLE);
-                    session.setUpdatedAt(now());
-                    return sessionRepository.save(session);
-                });
-    }
-
-    private WhatsAppContact getOrCreateDoctorContact(String phoneNumber) {
-        return contactRepository.findByWaUserId(phoneNumber)
-                .orElseGet(() -> {
-                    WhatsAppContact contact = new WhatsAppContact();
-                    contact.setWaUserId(phoneNumber);
-                    contact.setDisplayNumber(phoneNumber);
-                    contact.setCreatedAt(now());
-                    contact.setLastSeenAt(now());
-                    return contactRepository.save(contact);
-                });
-    }
-
-    private void setDoctorState(WhatsAppSession session, SessionState state) {
-        session.setCurrentState(state);
-        session.setUpdatedAt(now());
-        sessionRepository.save(session);
-    }
-
-    private void resetDoctorFlow(WhatsAppSession session) {
-        session.setCurrentState(SessionState.DOC_IDLE);
-        session.setUpdatedAt(now());
-        sessionRepository.save(session);
-    }
-
-    // ===================================================================================
-    // INTERACTIVE MESSAGE BUILDERS
-    // ===================================================================================
-
-    private static Timestamp now() {
-        return new Timestamp(System.currentTimeMillis());
-    }
-
-    private List<SendInteractiveListRequest.Row> doctorMainOptions() {
-        return List.of(
-            new SendInteractiveListRequest.Row("CRT_PAT","Registrar Paciente","Registre un nuevo paciente"),
-            new SendInteractiveListRequest.Row("CITAS","Ver Citas","Vea las 10 últimas citas"),
-            new SendInteractiveListRequest.Row("PAGO","Cobrar al Paciente","Efectivo o Transferencia"),
-            new SendInteractiveListRequest.Row("UPD_CITA","Modificar cita","Cambiar nombre, fecha, etc de una cita"),
-            new SendInteractiveListRequest.Row("SRCH_PAT","Buscar Paciente","Busque paciente por nombre, apellido o fecha")
-        );
-    }
-
-    private List<SendInteractiveButtonRequest.Button> paymentMethodButtons() {
-        return List.of(
-                new SendInteractiveButtonRequest.Button("reply",
-                        new SendInteractiveButtonRequest.Reply("PAY_EFECTIVO", "EFECTIVO")),
-                new SendInteractiveButtonRequest.Button("reply",
-                        new SendInteractiveButtonRequest.Reply("PAY_TRANSFERENCIA", "TRANSFERENCIA")));
-    }
-
-    private List<SendInteractiveButtonRequest.Button> paymentStatusButtons() {
-        return List.of(
-                new SendInteractiveButtonRequest.Button("reply",
-                        new SendInteractiveButtonRequest.Reply("PAT_STAT_COMPLETE",
-                                PatientPaymentState.COMPLETE.toString())),
-                new SendInteractiveButtonRequest.Button("reply",
-                        new SendInteractiveButtonRequest.Reply("PAT_STAT_PARTIALLY",
-                                PatientPaymentState.PARTIALLY.toString())),
-                new SendInteractiveButtonRequest.Button("reply",
-                        new SendInteractiveButtonRequest.Reply("PAT_STAT_INDEBT",
-                                PatientPaymentState.IN_DEBT.toString())));
+        return SPANISH_MONTHS.keySet().stream()
+                .anyMatch(month -> normalized.matches(".*\\b" + Pattern.quote(month) + "\\b.*"));
     }
 
     /**
@@ -1096,11 +1549,9 @@ public class WhatsAppBotService {
      * @param doctorPhone Recipient phone number of the doctor
      * @param pageNumber  Zero-based page index (0 = first 10, 1 = next 10, etc.)
      */
-
-    /// a method for showing just the message, with a Page<Appointment> parameter
-
-    private void showAppointmentsPageMessage(String doctorPhone, int pageNumber, Page<Appointment> appointmentPage){
+    private void showAppointmentsPage(String doctorPhone, int pageNumber) {
         int pageSize = 10;
+        Page<Appointment> appointmentPage = appointmentRepository.findAllByOrderByCreatedAtDesc(PageRequest.of(pageNumber, pageSize));
 
         if (appointmentPage.isEmpty()) {
             whatsAppClient.sendTextMessage(doctorPhone, "No se encontraron citas registradas.");
@@ -1164,11 +1615,6 @@ public class WhatsAppBotService {
             sb.append("🏁 _Fin del listado de citas._");
             whatsAppClient.sendTextMessage(doctorPhone, sb.toString().trim());
         }
-    }
-
-
-    private Page<Appointment> showAppointmentsPage(int pageNumber) {
-        return appointmentRepository.findAllByOrderByCreatedAtDesc(PageRequest.of(pageNumber, 10));
     }
 
     private void saveMessageRecord(WhatsAppContact contact, String providerId, String direction, String text) {
@@ -1356,81 +1802,63 @@ public class WhatsAppBotService {
      * @return A valid {@link LocalDateTime} representing the scheduled appointment,
      *         or {@code null} if a date could not be determined.
      */
-    private LocalTime parsedDoctorCustomizedTime(String messageDoctor){
-        String input = messageDoctor == null ? "" : messageDoctor.trim();
-        // -----------------------------------------------------------------------------------
-        // EXTRACT TIME (or default to 10:00 AM standard appointment hour)
-        // -----------------------------------------------------------------------------------
+    private LocalDateTime parsedDoctorCustomizedDate(String messageDoctor) {
+        if (messageDoctor == null || messageDoctor.isBlank()) {
+            log.warn("Doctor message is null or blank for custom date parsing.");
+            return null;
+        }
 
+        String input = messageDoctor.trim();
+
+        // -----------------------------------------------------------------------------------
+        // STEP 1: EXTRACT TIME (or default to 10:00 AM standard appointment hour)
+        // -----------------------------------------------------------------------------------
         LocalTime timeFound = findTime(input);
         if (timeFound == null) {
             // Default clinic appointment time if doctor didn't specify an hour
             timeFound = LocalTime.of(10, 0);
         }
-        return timeFound;
-    }
-    private LocalDate parsedDoctorCustomizedDate(String messageDoctor) {
-        if (messageDoctor == null || messageDoctor.isBlank()) {
-            log.warn("Doctor message is null or blank for custom date parsing.");
-            return null;
-        }
-        String input = messageDoctor.trim();
 
         // -----------------------------------------------------------------------------------
-        // EXTRACT DATE (Relative words, Numeric format, or Spanish written format)
+        // STEP 2: EXTRACT DATE (Numeric format or Spanish written format)
         // -----------------------------------------------------------------------------------
         int day = 0;
         int monthValue = 0;
         int year = LocalDate.now().getYear(); // Default to current year if omitted
 
-        // Pattern 0: Relative words like "hoy", "mañana" (o "manana"), "pasado mañana"
-        Pattern relativeDatePattern = Pattern.compile("\\b(hoy|mañana|manana|pasado\\s+mañana|pasado\\s+manana)\\b", Pattern.CASE_INSENSITIVE);
-        Matcher relativeMatcher = relativeDatePattern.matcher(input);
-
         // Pattern A: Numeric date dd/MM/yyyy or dd-MM-yyyy or dd/MM (e.g., "24/11/2026", "24/11")
         Pattern numericDatePattern = Pattern.compile("\\b(\\d{1,2})[/\\-](\\d{1,2})(?:[/\\-](\\d{4}))?\\b");
         Matcher numericMatcher = numericDatePattern.matcher(input);
 
-        // Pattern B: Written Spanish date: e.g. "5 de noviembre del 2026", "el 12 nov 2026", "5 de noviembre"
-        Pattern writtenDatePattern = Pattern.compile(
-                "\\b(\\d{1,2})\\s*(?:de)?\\s*([a-zA-ZáéíóúÁÉÍÓÚñÑ]+)(?:\\s*(?:del?|de)?\\s*(\\d{4}))?\\b",
-                Pattern.CASE_INSENSITIVE
-        );
-        Matcher writtenMatcher = writtenDatePattern.matcher(input);
-
-        if (relativeMatcher.find()) {
-            String matchedWord = relativeMatcher.group(1).toLowerCase();
-            LocalDate targetDate;
-            if (matchedWord.contains("pasado")) {
-                targetDate = LocalDate.now().plusDays(2);
-            } else if (matchedWord.startsWith("mañan") || matchedWord.startsWith("manan")) {
-                targetDate = LocalDate.now().plusDays(1);
-            } else {
-                targetDate = LocalDate.now();
-            }
-            day = targetDate.getDayOfMonth();
-            monthValue = targetDate.getMonthValue();
-            year = targetDate.getYear();
-        } else if (numericMatcher.find()) {
+        if (numericMatcher.find()) {
             day = Integer.parseInt(numericMatcher.group(1));
             monthValue = Integer.parseInt(numericMatcher.group(2));
             if (numericMatcher.group(3) != null) {
                 year = Integer.parseInt(numericMatcher.group(3));
             }
-        } else if (writtenMatcher.find()) {
-            day = Integer.parseInt(writtenMatcher.group(1));
-            String monthWord = writtenMatcher.group(2);
-            Month month = findMonth(monthWord);
-            if (month != null) {
-                monthValue = month.getValue();
-            }
-            if (writtenMatcher.group(3) != null) {
-                year = Integer.parseInt(writtenMatcher.group(3));
+        } else {
+            // Pattern B: Written Spanish date: e.g. "5 de noviembre del 2026", "el 12 nov 2026", "5 de noviembre"
+            Pattern writtenDatePattern = Pattern.compile(
+                    "\\b(\\d{1,2})\\s*(?:de)?\\s*([a-zA-ZáéíóúÁÉÍÓÚñÑ]+)(?:\\s*(?:del?|de)?\\s*(\\d{4}))?\\b",
+                    Pattern.CASE_INSENSITIVE
+            );
+            Matcher writtenMatcher = writtenDatePattern.matcher(input);
+
+            if (writtenMatcher.find()) {
+                day = Integer.parseInt(writtenMatcher.group(1));
+                String monthWord = writtenMatcher.group(2);
+                Month month = findMonth(monthWord);
+                if (month != null) {
+                    monthValue = month.getValue();
+                }
+                if (writtenMatcher.group(3) != null) {
+                    year = Integer.parseInt(writtenMatcher.group(3));
+                }
             }
         }
 
         // -----------------------------------------------------------------------------------
-        // VALIDATE AND BUILD LOCAL DATE
+        // STEP 3: VALIDATE AND BUILD LOCALDATETIME
         // -----------------------------------------------------------------------------------
         if (day < 1 || day > 31 || monthValue < 1 || monthValue > 12) {
             log.warn("Could not extract a valid date from doctor's message: '{}'", messageDoctor);
@@ -1439,13 +1867,13 @@ public class WhatsAppBotService {
 
         try {
             LocalDate date = LocalDate.of(year, monthValue, day);
-            log.info("Successfully parsed customized doctor appointment: {}", date);
-            return date;
+            LocalDateTime scheduledDateTime = LocalDateTime.of(date, timeFound);
+            log.info("Successfully parsed customized doctor appointment: {}", scheduledDateTime);
+            return scheduledDateTime;
         } catch (DateTimeException e) {
             log.error("Invalid calendar date constructed from doctor message '{}': {}", messageDoctor, e.getMessage());
             return null;
         }
     }
-
     private record ParsedPatientInfo(String name, Integer age) {}
 }

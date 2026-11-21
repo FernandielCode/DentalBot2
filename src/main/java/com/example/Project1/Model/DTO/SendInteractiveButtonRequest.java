@@ -49,6 +49,10 @@ public record SendInteractiveButtonRequest(
                 )
         );
     }
+    public static Button replyButton(String id, String title) {
+        return new Button("reply", new Reply(id, title));
+    }
+
     public static SendInteractiveButtonRequest createMultipleButtons(
             String to,
             String bodyText,

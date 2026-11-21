@@ -12,15 +12,9 @@ public class WhatsAppProperties {
     private String accessToken = "${WHATSAPP_ACCESS_TOKEN}";
     private String verifyToken = "${WHATSAPP_VERIFY_TOKEN}";
     private Doctor doctor = new Doctor();
-    private Flows flows = new Flows();
 
     public static class Doctor {
         private String phoneNumber;
-        /**
-         * Development switch: when true, the doctor's number is also treated as a
-         * patient number, so greetings fall through to the patient intake flow.
-         */
-        private boolean patientMode = false;
 
         public String getPhoneNumber() {
             return phoneNumber;
@@ -28,44 +22,6 @@ public class WhatsAppProperties {
 
         public void setPhoneNumber(String phoneNumber) {
             this.phoneNumber = phoneNumber;
-        }
-
-        public boolean isPatientMode() {
-            return patientMode;
-        }
-
-        public void setPatientMode(boolean patientMode) {
-            this.patientMode = patientMode;
-        }
-    }
-
-    public static class Flows {
-        private String patientRegistration;
-        private String updateAppointment;
-        private String searchPatient;
-
-        public String getPatientRegistration() {
-            return patientRegistration;
-        }
-
-        public void setPatientRegistration(String patientRegistration) {
-            this.patientRegistration = patientRegistration;
-        }
-
-        public String getUpdateAppointment() {
-            return updateAppointment;
-        }
-
-        public void setUpdateAppointment(String updateAppointment) {
-            this.updateAppointment = updateAppointment;
-        }
-
-        public String getSearchPatient() {
-            return searchPatient;
-        }
-
-        public void setSearchPatient(String searchPatient) {
-            this.searchPatient = searchPatient;
         }
     }
 
@@ -107,13 +63,5 @@ public class WhatsAppProperties {
 
     public void setDoctor(Doctor doctor) {
         this.doctor = doctor;
-    }
-
-    public Flows getFlows() {
-        return flows;
-    }
-
-    public void setFlows(Flows flows) {
-        this.flows = flows;
     }
 }

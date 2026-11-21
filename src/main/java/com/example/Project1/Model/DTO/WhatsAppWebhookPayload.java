@@ -96,24 +96,6 @@ public record WhatsAppWebhookPayload(
             }
             return null;
         }
-
-        /**
-         * True when the message is the response produced when a user completes a WhatsApp Flow.
-         */
-        public boolean isFlowResponse() {
-            return interactive != null && "nfm_reply".equals(interactive.type());
-        }
-
-        /**
-         * Returns the raw Flow completion payload. The value is a JSON string whose
-         * structure is controlled by the Flow JSON "complete" action.
-         */
-        public String getFlowResponseJson() {
-            if (isFlowResponse() && interactive.flowReply() != null) {
-                return interactive.flowReply().responseJson();
-            }
-            return null;
-        }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -128,8 +110,7 @@ public record WhatsAppWebhookPayload(
     public record InteractiveReply(
             String type,
             @JsonProperty("list_reply") Selection listReply,
-            @JsonProperty("button_reply") Selection buttonReply,
-            @JsonProperty("nfm_reply") FlowReply flowReply
+            @JsonProperty("button_reply") Selection buttonReply
     ) {}
 
     /**
@@ -140,16 +121,5 @@ public record WhatsAppWebhookPayload(
             String id,
             String title,
             String description
-    ) {}
-
-    /**
-     * Payload returned when a user completes a WhatsApp Flow.
-     * {@code responseJson} is a JSON string produced by the Flow's "complete" action.
-     */
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    public record FlowReply(
-            String name,
-            String body,
-            @JsonProperty("response_json") String responseJson
     ) {}
 }
