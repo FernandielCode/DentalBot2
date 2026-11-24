@@ -151,7 +151,9 @@ The Spring Boot artifact is the deployable backend. The Vue app and static site 
 │   └── test/java/com/example/Project1/
 │       ├── Project1ApplicationTests.java       # contextLoads()
 │       ├── Controller/WhatsAppWebhookControllerTest.java
-│       └── Service/WhatsAppSignatureVerifierTest.java
+│       └── Service/
+│           ├── WhatsAppSignatureVerifierTest.java
+│           └── WhatsAppBotServiceDateConfirmationTest.java
 ```
 
 ---
@@ -364,17 +366,18 @@ Current backend tests:
 - `Project1ApplicationTests.contextLoads()` boots the full application context and needs the datasource configuration to be resolvable.
 - `WhatsAppSignatureVerifierTest` covers valid, invalid, missing, and malformed `X-Hub-Signature-256` values.
 - `WhatsAppWebhookControllerTest` covers `401`, `400`, and `200` behavior with `MockMvc`.
+- `WhatsAppBotServiceDateConfirmationTest` verifies that the doctor's selected appointment is persisted and that only that appointment is confirmed.
 
-Run only the signature-related tests without a database:
+Run the unit tests without a database:
 
 ```bash
-./mvnw -Dtest=WhatsAppSignatureVerifierTest,WhatsAppWebhookControllerTest test
+./mvnw -Dtest=WhatsAppSignatureVerifierTest,WhatsAppWebhookControllerTest,WhatsAppBotServiceDateConfirmationTest test
 ```
 
 On Windows:
 
 ```powershell
-.\mvnw.cmd "-Dtest=WhatsAppSignatureVerifierTest,WhatsAppWebhookControllerTest" test
+.\mvnw.cmd "-Dtest=WhatsAppSignatureVerifierTest,WhatsAppWebhookControllerTest,WhatsAppBotServiceDateConfirmationTest" test
 ```
 
 ---
@@ -423,16 +426,29 @@ The doctor is identified by exact match against `DOCTOR_WHATSAPP_PHONE`.
 
 | Trigger | Behavior |
 |---|---|
-| `hola`, `menu`, `opciones` | Sends the main interactive menu: `Buscar`, `Cambiar`, `Cobrar`, `Pacientes`, `Registrar paciente`. |
+| `hola`, `menu`, `opciones` | Sends the main interactive menu: `Buscar`, `Cambiar`, `Cobrar`, `Pacientes`, `Fechas`, `Registrar paciente`. |
 | `citas` | Paginated appointment list (10 per page) with a `Ver más citas` button. |
 | `pago` or menu `Cobrar` | Sends the treatment list, then the legacy payment-method list. |
+| `fechas` or menu `Fechas` | Lists all appointments waiting for a doctor-assigned date, oldest request first. |
 | Menu `Buscar` | Asks for a search query; searches name, lastname, full name, phone, date, and treatment. |
 | Menu `Cambiar` | Sends `PACIENTE` / `CITA` buttons, then the search flow, then the update field flow. |
 | Menu `Pacientes` | Paginated patient list (10 per page) with a `Ver más pacientes` button. |
 | Menu `Registrar paciente` | Sequential patient registration (name, lastname, phone, age, patient state, payment state). |
-| Date confirmation | When `isWaitingDate` is true, parses a doctor-supplied date and confirms the latest `PENDING` appointment. |
+| Date confirmation | The doctor taps **Asignar fecha** or uses **Fechas**, selects a specific appointment, then sends a date. The appointment is confirmed by id, not by "latest PENDING". |
 
-### Doctor conversation states (in-memory)
+### Date confirmation flow
+
+- When a patient completes intake, the new `Appointment` gets `awaitingDateConfirmation = true` and `dateConfirmationRequestedAt`.
+- The doctor receives an **Asignar fecha** button carrying `DATE_CONFIRM_<appointmentId>`.
+- `fechas` / **Fechas** lists every appointment with `awaitingDateConfirmation = true`, oldest first.
+- Selecting one persists the appointment id in the doctor's `WhatsAppSession`:
+  - `currentState = DOC_AWAITING_CONFIRMATION_DATE`
+  - `contextJSON = <appointmentId>`
+- The doctor's next date text updates that exact appointment, clears `awaitingDateConfirmation`, and clears the doctor's saved selection.
+- If the doctor types a date without selecting an appointment, the bot shows the waiting list instead of guessing.
+- Both the appointment flag and the doctor's selected appointment survive application restarts.
+
+### Doctor conversation states (mostly in-memory)
 
 `WhatsAppBotService` keeps a `ConcurrentHashMap<String, DoctorSession>` keyed by doctor phone. The states are:
 
@@ -446,7 +462,9 @@ The doctor is identified by exact match against `DOCTOR_WHATSAPP_PHONE`.
 - `UPDATE_AWAITING_CONFIRM`
 - `REGISTER_AWAITING_FIELD`
 
-This doctor state is **not persisted**. It is lost on application restart and is not shared across instances.
+These in-memory states are **not persisted**. They are lost on application restart and are not shared across instances.
+
+The exception is the date-confirmation selection: the selected appointment id is stored in `whatsapp_sessions` with `currentState = DOC_AWAITING_CONFIRMATION_DATE` and `contextJSON = <appointmentId>`. It survives restarts, and the patient/appointment waiting state is stored on the `Appointment` row.
 
 ### Update flow details
 
@@ -496,12 +514,12 @@ This doctor state is **not persisted**. It is lost on application restart and is
 | Table | Entity | Active in current bot logic? |
 |---|---|---|
 | `patients` | `Patient` | Yes |
-| `appointments` | `Appointment` | Yes |
+| `appointments` | `Appointment` | Yes (includes `awaitingDateConfirmation` and `dateConfirmationRequestedAt`) |
 | `dentists` | `Dentist` | Yes (active dentist lookup, update validation) |
 | `treatments` | `Treatments` | Yes (list/price lookup, update validation) |
 | `appointment_treatments` | Join table | Yes |
 | `whatsapp_contacts` | `WhatsAppContact` | Yes |
-| `whatsapp_sessions` | `WhatsAppSession` | Yes (patient `currentState`) |
+| `whatsapp_sessions` | `WhatsAppSession` | Yes (patient intake `currentState`; doctor date-confirmation selection) |
 | `whatsapp_messages` | `WhatsAppMessage` | Yes (message audit) |
 | `message_threads` | `MessageThread` | Modeled; no bot/controller references found |
 | `messages` | `Message` | Modeled; no bot/controller references found |
@@ -509,6 +527,19 @@ This doctor state is **not persisted**. It is lost on application restart and is
 | `notifications` | `Notification` | Modeled; no bot/controller references found |
 | `whatsapp_templates` | `WhatsAppTemplate` | Modeled; no bot/controller references found |
 | `whatsapp_webhook_events` | `WhatsAppWebhookEvent` | Modeled; no bot/controller references found |
+
+The date-confirmation workflow state lives in two places:
+
+- `appointments.awaiting_date_confirmation` and `appointments.date_confirmation_requested_at` — which appointments are waiting.
+- `whatsapp_sessions.current_state = DOC_AWAITING_CONFIRMATION_DATE` and `whatsapp_sessions.context_json = <appointmentId>` — which appointment the doctor is currently assigning a date to.
+
+Production schema change for the new appointment columns:
+
+```sql
+ALTER TABLE appointments
+    ADD COLUMN awaiting_date_confirmation BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN date_confirmation_requested_at TIMESTAMP NULL;
+```
 
 ### Domain enums
 
@@ -530,7 +561,8 @@ This doctor state is **not persisted**. It is lost on application restart and is
 
 - `Project1ApplicationTests.contextLoads()` starts the full Spring context, so the datasource configuration must be resolvable.
 - `WhatsAppSignatureVerifierTest` and `WhatsAppWebhookControllerTest` cover signature validation and webhook status codes.
-- There are no bot-flow integration tests yet.
+- `WhatsAppBotServiceDateConfirmationTest` covers the persisted doctor selection and the appointment-specific date confirmation.
+- There are no end-to-end bot-flow integration tests yet.
 
 ### Common pitfalls
 
@@ -542,8 +574,8 @@ This doctor state is **not persisted**. It is lost on application restart and is
 | Every POST returns `401` | Signature verification enabled but `WHATSAPP_APP_SECRET` is missing or wrong | Set the Meta app secret, or set `WHATSAPP_SIGNATURE_VERIFICATION_ENABLED=false` locally |
 | Data disappears after restart | `spring.jpa.hibernate.ddl-auto=create-drop` | Use migrations and a non-destructive setting for production |
 | Doctor commands do not trigger | `DOCTOR_WHATSAPP_PHONE` does not exactly match the incoming `from` value | Confirm the international number format used by Meta |
-| Doctor multi-step flow resets | Doctor session state is in-memory | Restart clears `DoctorSession`; do not scale horizontally without moving state to a shared store |
-| Pending date confirmation is lost | `isWaitingDate` is a single in-memory boolean | Restart or concurrent doctor messages can reset/overwrite it |
+| Search/update/register flow resets | Those flows use in-memory `DoctorSession` state | Restart clears them; the date-confirmation selection is persisted separately |
+| `awaiting_date_confirmation` column missing | Production DB schema not migrated | Add the new `appointments` columns or run the migration; dev uses `ddl-auto=create-drop` |
 | Duplicate replies for one Meta event | Authenticated events return `200`; no idempotency check | Implement `WhatsAppWebhookEvent.eventKey` deduplication |
 | Webhook signature mismatch | Wrong app secret, altered/re-encoded body, or a proxy changing the payload | Ensure the raw body reaches the app unchanged; verify `WHATSAPP_APP_SECRET` |
 | REST API is publicly readable/writable | `SecurityConfig` permits all requests | Add authentication/authorization before production |
@@ -586,6 +618,7 @@ This doctor state is **not persisted**. It is lost on application restart and is
 | ADR-0012 | In-Memory Search Over `findAll` | Inferred from Codebase |
 | ADR-0013 | No Idempotency or Retry Enforcement (Open) | Inferred from Codebase |
 | ADR-0014 | Webhook HMAC-SHA256 Signature Validation | Accepted |
+| ADR-0015 | Persistent Per-Appointment Date Confirmation | Accepted |
 
 ### ADR-0001: Layered Spring Boot Monolith
 
@@ -615,11 +648,13 @@ This doctor state is **not persisted**. It is lost on application restart and is
 - **Context:** Both patient intake and doctor administrative workflows span multiple messages.
 - **Decision:**
   - Patient state is persisted in `WhatsAppSession.currentState` (`INITIAL`, `AWAITING_PATIENT_INFO`, `COMPLETED`).
-  - Doctor multi-step state is kept in an in-memory `ConcurrentHashMap<String, DoctorSession>` keyed by doctor phone.
+  - Doctor search/update/register flows are kept in an in-memory `ConcurrentHashMap<String, DoctorSession>` keyed by doctor phone.
+  - The date-confirmation selection is persisted in a doctor-level `WhatsAppSession` (`currentState = DOC_AWAITING_CONFIRMATION_DATE`, `contextJSON = appointmentId`).
 - **Consequences:**
-  - Patient state survives application restarts; doctor state does not.
-  - Doctor flows are not safe for multiple application instances without moving state to a shared store.
+  - Patient state and the selected date-confirmation appointment survive application restarts.
+  - Search/update/register doctor flows are lost on restart and are not safe across multiple instances without shared state.
   - Preserve state transitions and reset doctor state on the global `hola` escape hatch.
+  - Clear the persisted date selection when the doctor switches to another flow (`citas`, `pago`, menu, `fechas`).
 
 ### ADR-0004: Doctor Identity by Configured Phone Number
 
@@ -743,12 +778,29 @@ This doctor state is **not persisted**. It is lost on application restart and is
   - `WHATSAPP_APP_SECRET` must be provisioned in every environment where POSTs are accepted.
   - Signature validation does not provide replay protection or idempotency; those remain part of ADR-0013.
 
+### ADR-0015: Persistent Per-Appointment Date Confirmation
+
+- **Status:** Accepted
+- **Context:** The previous date-confirmation flow used a single in-memory `isWaitingDate` boolean and `findTopByAppointmentStatusOrderByCreatedAtDesc("PENDING")`. With two patients registering close together, the doctor's date could be applied to the wrong appointment. The flag was also lost on restart.
+- **Decision:**
+  - Store `awaitingDateConfirmation` and `dateConfirmationRequestedAt` on `Appointment`.
+  - When a patient registers, mark that appointment as awaiting confirmation and send the doctor an `Asignar fecha` button carrying `DATE_CONFIRM_<appointmentId>`.
+  - Add a `fechas` command and `Fechas` menu option to list waiting appointments oldest-first.
+  - Persist the doctor's selected appointment in `WhatsAppSession` (`currentState = DOC_AWAITING_CONFIRMATION_DATE`, `contextJSON = appointmentId`).
+  - Confirm the appointment by the selected id; never fall back to "latest PENDING".
+  - Clear the appointment flag and doctor selection after confirmation or when the doctor switches flows.
+- **Consequences:**
+  - Multiple patients can be waiting without ambiguity; the doctor must select one.
+  - The waiting state and selected appointment survive restarts.
+  - The `appointments` table needs new columns in production; `ddl-auto=create-drop` handles this in dev only.
+  - The doctor must tap `Asignar fecha`/`Fechas` before sending a date; free-text dates without a selection show the waiting list.
+
 ### Proposed / Open ADR Topics
 
 The following decisions should be recorded next:
 
 - Idempotent webhook processing and retry/backoff policy.
-- Shared persistent storage for doctor conversation state (DB/Redis).
+- Persisting search/update/register doctor conversation state (DB/Redis) for multi-instance safety.
 - Multi-doctor/multi-tenant authentication and authorization.
 - Database migration strategy (Flyway/Liquibase) and production `ddl-auto`.
 - REST API authentication and IDOR protection for patient/appointment endpoints.

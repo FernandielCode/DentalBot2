@@ -49,6 +49,11 @@ public class WhatsAppBotService {
     private static final String MENU_PAY = "DOC_MENU_PAY";
     private static final String MENU_PATIENTS = "DOC_MENU_PATIENTS";
     private static final String MENU_REGISTER = "DOC_MENU_REGISTER";
+    private static final String MENU_DATES = "DOC_MENU_DATES";
+
+    private static final String DATE_CONFIRM_PREFIX = "DATE_CONFIRM_";
+    private static final String DOCTOR_DATE_STATE = "DOC_AWAITING_CONFIRMATION_DATE";
+    private static final String DOCTOR_IDLE_STATE = "DOC_IDLE";
 
     private static final String TARGET_PATIENT = "UPD_TARGET_PATIENT";
     private static final String TARGET_CITA = "UPD_TARGET_CITA";
@@ -112,7 +117,6 @@ public class WhatsAppBotService {
     private final AppointmentRepository appointmentRepository;
     private final DentistRepository dentistRepository;
 
-    private boolean isWaitingDate = false;
     public WhatsAppBotService(WhatsAppClient whatsAppClient,
                               WhatsAppProperties properties,
                               WhatsAppContactRepository contactRepository,
@@ -195,7 +199,7 @@ public class WhatsAppBotService {
         // -----------------------------------------------------------------------------------
         String doctorPhone = properties.getDoctor() != null ? properties.getDoctor().getPhoneNumber() : null;
         if (doctorPhone != null && !doctorPhone.isBlank() && fromPhone.equals(doctorPhone)) {
-            if (handleDoctorMessage(doctorPhone, incomingMessage, messageBody)) {
+            if (handleDoctorMessage(doctorPhone, incomingMessage, messageBody, contact)) {
                 return;
             }
         }
@@ -273,6 +277,10 @@ public class WhatsAppBotService {
             // Assign default active dentist if configured
             Optional<Dentist> activeDentist = dentistRepository.findFirstByIsDentistActiveTrue();
             activeDentist.ifPresent(appointment::setDentistAppointment);
+
+            // Persist the fact that this specific appointment is waiting for the doctor's date.
+            appointment.setAwaitingDateConfirmation(true);
+            appointment.setDateConfirmationRequestedAt(new Timestamp(System.currentTimeMillis()));
             appointmentRepository.save(appointment);
 
             // Acknowledge receipt to the Patient
@@ -280,15 +288,22 @@ public class WhatsAppBotService {
             whatsAppClient.sendTextMessage(fromPhone, patientAck);
             saveMessageRecord(contact, null, "OUTGOING", patientAck);
 
-            // Forward notification to the Doctor
+            // Forward notification to the Doctor with an actionable button carrying the appointment id.
             String doctorMessage = "El paciente " + parsedInfo.name + " con edad " + parsedInfo.age
-                    + ", Cuando desearía recibir a este paciente?, aquí hay algunas sugerencias: \n"
-                    + suggestedAppointment + ". Si desea, puede poner la fecha ud mismo de la siguiente manera \n"
-                    + "*<día> de <mes> <hora> (Ejemplo: 20 de noviembre de 2026)*";
-            isWaitingDate = true;
-            String recipientDoctor = (doctorPhone != null && !doctorPhone.isBlank()) ? doctorPhone : fromPhone;
-            whatsAppClient.sendTextMessage(recipientDoctor, doctorMessage);
-            log.info("Forwarded patient details to Doctor ({})", recipientDoctor);
+                    + " está esperando la fecha de su cita.\n"
+                    + "Sugerencia: " + suggestedAppointment + ".\n"
+                    + "Toque *Asignar fecha* para indicar la fecha.";
+            if (doctorPhone != null && !doctorPhone.isBlank()) {
+                whatsAppClient.sendInteractiveButton(
+                        doctorPhone,
+                        doctorMessage,
+                        "Asignar fecha",
+                        DATE_CONFIRM_PREFIX + appointment.getAppointmentId());
+                log.info("Forwarded patient details to Doctor ({})", doctorPhone);
+            } else {
+                log.warn("Doctor phone is not configured; date confirmation request for appointment {} "
+                        + "was not sent", appointment.getAppointmentId());
+            }
 
             session.setCurrentState("COMPLETED");
             session.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
@@ -302,32 +317,49 @@ public class WhatsAppBotService {
      * @param doctorPhone     The verified phone number of the doctor
      * @param incomingMessage The incoming webhook message payload
      * @param messageBody     Text content of the message or selected menu option
+     * @param contact         The persisted doctor contact, used for the date-confirmation session
      * @return true if the message was handled as a doctor command, false to allow default flow
      */
     private boolean handleDoctorMessage(String doctorPhone,
                                         WhatsAppWebhookPayload.IncomingMessage incomingMessage,
-                                        String messageBody) {
+                                        String messageBody,
+                                        WhatsAppContact contact) {
         DoctorSession session = doctorSessions.computeIfAbsent(doctorPhone, key -> new DoctorSession());
         synchronized (session) {
-            return handleDoctorMessageLocked(doctorPhone, incomingMessage, messageBody, session);
+            return handleDoctorMessageLocked(doctorPhone, incomingMessage, messageBody, contact, session);
         }
     }
 
     private boolean handleDoctorMessageLocked(String doctorPhone,
                                               WhatsAppWebhookPayload.IncomingMessage incomingMessage,
                                               String messageBody,
+                                              WhatsAppContact contact,
                                               DoctorSession session) {
         String selectedOptionId = incomingMessage.getInteractiveSelectionId();
         String trimmed = messageBody == null ? "" : messageBody.trim();
 
         if (isMenuText(trimmed)) {
+            clearDoctorDateSelection(contact);
             resetDoctorSession(session);
             sendDoctorMenu(doctorPhone);
             return true;
         }
 
+        if ("fechas".equalsIgnoreCase(trimmed)) {
+            clearDoctorDateSelection(contact);
+            resetDoctorSession(session);
+            sendAwaitingDateList(doctorPhone);
+            return true;
+        }
+
         if (selectedOptionId != null && selectedOptionId.startsWith("DOC_MENU_")) {
+            clearDoctorDateSelection(contact);
             return handleMenuSelection(doctorPhone, session, selectedOptionId);
+        }
+
+        if (selectedOptionId != null && selectedOptionId.startsWith(DATE_CONFIRM_PREFIX)) {
+            resetDoctorSession(session);
+            return handleDateConfirmationSelection(doctorPhone, contact, selectedOptionId);
         }
 
         if (session.state != DoctorState.IDLE) {
@@ -335,14 +367,17 @@ public class WhatsAppBotService {
         }
 
         if ("citas".equalsIgnoreCase(trimmed)) {
+            clearDoctorDateSelection(contact);
             showAppointmentsPage(doctorPhone, 0);
             return true;
         }
         if ("pago".equalsIgnoreCase(trimmed)) {
+            clearDoctorDateSelection(contact);
             sendTreatmentList(doctorPhone);
             return true;
         }
         if (selectedOptionId != null && selectedOptionId.startsWith("CITAS_PAGE_")) {
+            clearDoctorDateSelection(contact);
             try {
                 int nextPage = Integer.parseInt(selectedOptionId.replace("CITAS_PAGE_", ""));
                 showAppointmentsPage(doctorPhone, nextPage);
@@ -352,6 +387,7 @@ public class WhatsAppBotService {
             return true;
         }
         if (selectedOptionId != null && selectedOptionId.startsWith(PATIENTS_PAGE_PREFIX)) {
+            clearDoctorDateSelection(contact);
             try {
                 int nextPage = Integer.parseInt(selectedOptionId.replace(PATIENTS_PAGE_PREFIX, ""));
                 showPatientsPage(doctorPhone, nextPage);
@@ -361,15 +397,21 @@ public class WhatsAppBotService {
             return true;
         }
 
-        if (isWaitingDate && selectedOptionId == null) {
-            if (handleDoctorDateConfirmation(doctorPhone, trimmed)) {
-                return true;
-            }
+        UUID selectedAppointmentId = getDoctorSelectedAppointmentId(contact);
+        if (selectedAppointmentId != null && selectedOptionId == null) {
+            return handleDoctorDateConfirmation(doctorPhone, contact, selectedAppointmentId, trimmed);
+        }
+
+        if (selectedOptionId == null
+                && appointmentRepository.countByAwaitingDateConfirmationTrue() > 0) {
+            sendAwaitingDateList(doctorPhone);
+            return true;
         }
 
         if (selectedOptionId != null
                 && !selectedOptionId.startsWith("UPD_")
                 && !selectedOptionId.startsWith("REG_")) {
+            clearDoctorDateSelection(contact);
             handleLegacyTreatmentSelection(doctorPhone, messageBody, selectedOptionId);
             return true;
         }
@@ -390,6 +432,7 @@ public class WhatsAppBotService {
                 new SendInteractiveListRequest.Row(MENU_UPDATE, "Cambiar", "Actualizar paciente o cita"),
                 new SendInteractiveListRequest.Row(MENU_PAY, "Cobrar", "Registrar pago de paciente"),
                 new SendInteractiveListRequest.Row(MENU_PATIENTS, "Pacientes", "Mostrar todos los pacientes"),
+                new SendInteractiveListRequest.Row(MENU_DATES, "Fechas", "Asignar fechas pendientes"),
                 new SendInteractiveListRequest.Row(MENU_REGISTER, "Registrar paciente", "Registrar un nuevo paciente")
         );
         whatsAppClient.sendInteractiveList(doctorPhone,
@@ -403,6 +446,7 @@ public class WhatsAppBotService {
             case MENU_UPDATE -> sendUpdateTargetButtons(doctorPhone, session);
             case MENU_PAY -> sendTreatmentList(doctorPhone);
             case MENU_PATIENTS -> showPatientsPage(doctorPhone, 0);
+            case MENU_DATES -> sendAwaitingDateList(doctorPhone);
             case MENU_REGISTER -> startPatientRegistration(doctorPhone, session);
             default -> sendDoctorMenu(doctorPhone);
         }
@@ -447,28 +491,63 @@ public class WhatsAppBotService {
         session.registerFieldIndex = 0;
     }
 
-    private boolean handleDoctorDateConfirmation(String doctorPhone, String messageBody) {
-        LocalDateTime customDate = parsedDoctorCustomizedDate(messageBody);
-        if (customDate == null) {
-            String retryMsg = "No logré reconocer la fecha. Por favor indíquela como: *día de mes hora* (Ejemplo: *24 de noviembre 10:00am*) o envíe *citas* para ver el listado.";
-            whatsAppClient.sendTextMessage(doctorPhone, retryMsg);
+    private boolean handleDateConfirmationSelection(String doctorPhone,
+                                                     WhatsAppContact contact,
+                                                     String selectedOptionId) {
+        UUID appointmentId;
+        try {
+            appointmentId = UUID.fromString(
+                    selectedOptionId.substring(DATE_CONFIRM_PREFIX.length()));
+        } catch (IllegalArgumentException e) {
+            whatsAppClient.sendTextMessage(doctorPhone, "Cita inválida.");
             return true;
         }
 
-        Optional<Appointment> latestPendingAppt =
-                appointmentRepository.findTopByAppointmentStatusOrderByCreatedAtDesc("PENDING");
-        if (latestPendingAppt.isEmpty()) {
-            log.warn("isWaitingDate is true, but no PENDING appointment was found in DB.");
-            isWaitingDate = false;
-            return false;
+        Appointment appointment = appointmentRepository.findById(appointmentId).orElse(null);
+        if (appointment == null || !appointment.isAwaitingDateConfirmation()) {
+            whatsAppClient.sendTextMessage(doctorPhone,
+                    "Esa cita ya no está pendiente de fecha.");
+            return true;
         }
 
-        Appointment appointment = latestPendingAppt.get();
+        saveDoctorDateSelection(contact, appointmentId);
+
+        String patientName = appointment.getPatientAppointment() != null
+                ? fullName(appointment.getPatientAppointment())
+                : "paciente";
+        whatsAppClient.sendTextMessage(doctorPhone,
+                "Escriba la nueva fecha para *" + patientName + "*:");
+        return true;
+    }
+
+    private boolean handleDoctorDateConfirmation(String doctorPhone,
+                                                 WhatsAppContact contact,
+                                                 UUID appointmentId,
+                                                 String messageBody) {
+        LocalDateTime customDate = parsedDoctorCustomizedDate(messageBody);
+        if (customDate == null) {
+            whatsAppClient.sendTextMessage(doctorPhone,
+                    "No logré reconocer la fecha. Por favor indíquela como: "
+                            + "*día de mes hora* (Ejemplo: *24 de noviembre 10:00am*) "
+                            + "o envíe *fechas* para ver el listado.");
+            return true;
+        }
+
+        Appointment appointment = appointmentRepository.findById(appointmentId).orElse(null);
+        if (appointment == null || !appointment.isAwaitingDateConfirmation()) {
+            whatsAppClient.sendTextMessage(doctorPhone,
+                    "Esa cita ya no está pendiente de fecha.");
+            clearDoctorDateSelection(contact);
+            return true;
+        }
+
         appointment.setStartAppointmentAt(Timestamp.valueOf(customDate));
         appointment.setAppointmentStatus("CONFIRMED");
+        appointment.setAwaitingDateConfirmation(false);
+        appointment.setDateConfirmationRequestedAt(null);
         appointmentRepository.save(appointment);
 
-        isWaitingDate = false;
+        clearDoctorDateSelection(contact);
 
         DateTimeFormatter formatter =
                 DateTimeFormatter.ofPattern("dd/MM/yyyy 'a las' hh:mma", Locale.of("es", "ES"));
@@ -476,14 +555,120 @@ public class WhatsAppBotService {
         whatsAppClient.sendTextMessage(doctorPhone,
                 "✅ Cita confirmada con éxito para el *" + formattedDate + "*.");
 
-        if (appointment.getPatientAppointment() != null
-                && appointment.getPatientAppointment().getPatientPhone() != null) {
-            String patientPhone = appointment.getPatientAppointment().getPatientPhone();
-            whatsAppClient.sendTextMessage(patientPhone,
+        Patient patient = appointment.getPatientAppointment();
+        if (patient != null && patient.getPatientPhone() != null) {
+            whatsAppClient.sendTextMessage(patient.getPatientPhone(),
                     "¡Hola! El doctor ha confirmado tu cita para el *"
                             + formattedDate + "*. Te esperamos en la clínica.");
         }
         return true;
+    }
+
+    private void sendAwaitingDateList(String doctorPhone) {
+        List<Appointment> awaiting = appointmentRepository
+                .findByAwaitingDateConfirmationTrueOrderByDateConfirmationRequestedAtAsc();
+
+        if (awaiting.isEmpty()) {
+            whatsAppClient.sendTextMessage(doctorPhone,
+                    "No hay citas pendientes de fecha.");
+            return;
+        }
+
+        List<SendInteractiveListRequest.Row> rows = awaiting.stream()
+                .limit(10)
+                .map(appointment -> {
+                    String patientName = appointment.getPatientAppointment() != null
+                            ? fullName(appointment.getPatientAppointment())
+                            : "Sin nombre";
+                    String description = "Solicitada: "
+                            + formatRequestedAt(appointment.getDateConfirmationRequestedAt());
+                    return new SendInteractiveListRequest.Row(
+                            DATE_CONFIRM_PREFIX + appointment.getAppointmentId(),
+                            truncate(patientName, 24),
+                            truncate(description, 72));
+                })
+                .toList();
+
+        whatsAppClient.sendInteractiveList(doctorPhone,
+                "Seleccione la cita a la que desea asignar la fecha",
+                "Ver Citas", rows);
+
+        if (awaiting.size() > 10) {
+            whatsAppClient.sendTextMessage(doctorPhone,
+                    "Hay más de 10 citas pendientes. Atienda las más antiguas primero.");
+        }
+    }
+
+    private String formatRequestedAt(Timestamp timestamp) {
+        if (timestamp == null) {
+            return "fecha no registrada";
+        }
+        return new SimpleDateFormat("dd/MM/yyyy HH:mm").format(timestamp);
+    }
+
+    private WhatsAppSession getOrCreateDoctorSession(WhatsAppContact contact) {
+        Optional<WhatsAppSession> existing = sessionRepository
+                .findByWhatsAppContact_WaUserId(contact.getWaUserId());
+        if (existing.isPresent()) {
+            return existing.get();
+        }
+
+        WhatsAppSession session = new WhatsAppSession();
+        session.setWhatsAppContact(contact);
+        session.setCurrentState(DOCTOR_IDLE_STATE);
+        session.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
+        return sessionRepository.save(session);
+    }
+
+    private void saveDoctorDateSelection(WhatsAppContact contact, UUID appointmentId) {
+        WhatsAppSession session = getOrCreateDoctorSession(contact);
+        session.setCurrentState(DOCTOR_DATE_STATE);
+        session.setContextJSON(appointmentId.toString());
+        session.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
+        sessionRepository.save(session);
+    }
+
+    private UUID getDoctorSelectedAppointmentId(WhatsAppContact contact) {
+        Optional<WhatsAppSession> sessionOpt = sessionRepository
+                .findByWhatsAppContact_WaUserId(contact.getWaUserId());
+        if (sessionOpt.isEmpty()) {
+            return null;
+        }
+
+        WhatsAppSession session = sessionOpt.get();
+        if (!DOCTOR_DATE_STATE.equals(session.getCurrentState())) {
+            return null;
+        }
+
+        String context = session.getContextJSON();
+        if (context == null || context.isBlank()) {
+            return null;
+        }
+
+        try {
+            return UUID.fromString(context.trim());
+        } catch (IllegalArgumentException e) {
+            log.warn("Invalid doctor date-confirmation context '{}'", context);
+            return null;
+        }
+    }
+
+    private void clearDoctorDateSelection(WhatsAppContact contact) {
+        Optional<WhatsAppSession> sessionOpt = sessionRepository
+                .findByWhatsAppContact_WaUserId(contact.getWaUserId());
+        if (sessionOpt.isEmpty()) {
+            return;
+        }
+
+        WhatsAppSession session = sessionOpt.get();
+        if (!DOCTOR_DATE_STATE.equals(session.getCurrentState())) {
+            return;
+        }
+
+        session.setCurrentState(DOCTOR_IDLE_STATE);
+        session.setContextJSON(null);
+        session.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
+        sessionRepository.save(session);
     }
 
     private void sendTreatmentList(String doctorPhone) {

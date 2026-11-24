@@ -53,6 +53,12 @@ public class Appointment {
     @Enumerated(EnumType.STRING)
     private PaymentMethod paymentMethod;
 
+    @Column(nullable = false)
+    private boolean awaitingDateConfirmation = false;
+
+    @Column
+    private Timestamp dateConfirmationRequestedAt;
+
     @Column
     private LocalDateTime appointmentDateTime;
 
@@ -183,5 +189,21 @@ public class Appointment {
 
     public void setPaymentMethod(PaymentMethod paymentMethod) {
         this.paymentMethod = paymentMethod;
+    }
+
+    public boolean isAwaitingDateConfirmation() {
+        return awaitingDateConfirmation;
+    }
+
+    public void setAwaitingDateConfirmation(boolean awaitingDateConfirmation) {
+        this.awaitingDateConfirmation = awaitingDateConfirmation;
+    }
+
+    public Timestamp getDateConfirmationRequestedAt() {
+        return dateConfirmationRequestedAt;
+    }
+
+    public void setDateConfirmationRequestedAt(Timestamp dateConfirmationRequestedAt) {
+        this.dateConfirmationRequestedAt = dateConfirmationRequestedAt;
     }
 }
