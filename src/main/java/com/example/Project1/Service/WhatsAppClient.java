@@ -32,7 +32,7 @@ public class WhatsAppClient {
     /**
      * Sends a plain text message to a WhatsApp user.
      *
-     * @param to Destination phone number with country code (e.g., 593983673346)
+     * @param to Destination phone number with country code
      * @param message Text body of the message
      * @return true if successfully delivered to Meta, false otherwise
      */
@@ -65,7 +65,7 @@ public class WhatsAppClient {
     /**
      * Sends an Interactive List Menu message to a WhatsApp user.
      *
-     * @param to Destination phone number with country code (e.g., 593983673346)
+     * @param to Destination phone number with country code
      * @param bodyText Prompt message displayed inside the chat balloon
      * @param buttonText Label displayed on the menu trigger button (max 20 characters)
      * @param rows List of selectable options (max 10 rows per menu)
@@ -100,7 +100,7 @@ public class WhatsAppClient {
     /**
      * Sends an interactive reply button message to a WhatsApp user.
      *
-     * @param to Destination phone number with country code (e.g., 593983673346)
+     * @param to Destination phone number with country code
      * @param bodyText Message text displayed in the chat balloon
      * @param buttonText Text written on the action button (e.g., "Ver más citas")
      * @param buttonId Unique action identifier (e.g., "CITAS_PAGE_1")

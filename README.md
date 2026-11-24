@@ -39,7 +39,6 @@ The bot serves two audiences:
 - No WhatsApp Flows DTOs or flow JSON resources are present in the current codebase.
 - No WebSocket/messaging dependency is used.
 - No template-message sending is implemented (`TemplateParameters` is an empty record).
-- No webhook signature validation (`X-Hub-Signature-256`) is implemented.
 - No Flyway/Liquibase migration tool is present.
 
 ### High-level request flow
@@ -47,8 +46,14 @@ The bot serves two audiences:
 ```text
 Meta WhatsApp Cloud API
         │  POST /api/whatsapp/webhook
+        │  X-Hub-Signature-256: sha256=<hex>
         ▼
 WhatsAppWebhookController
+        │
+        ├─ WhatsAppSignatureVerifier validates HMAC-SHA256
+        │       └─ invalid/missing → 401 Unauthorized
+        ▼
+JsonMapper.readValue(rawBody, WhatsAppWebhookPayload.class)
         ▼
 WhatsAppBotService.processWebhookEvent(...)
         │
@@ -68,14 +73,15 @@ WhatsAppClient
 | Surface | Implemented in | Notes |
 |---|---|---|
 | Webhook verification (`GET`) | `WhatsAppWebhookController.verifyWebhook` | Checks `hub.mode=subscribe` and `hub.verify_token == whatsapp.verify-token` |
-| Incoming messages (`POST`) | `WhatsAppWebhookController.receiveWebhookEvent` | Deserializes `WhatsAppWebhookPayload`; always returns `200 EVENT_RECEIVED` |
+| Webhook signature validation (`POST`) | `WhatsAppSignatureVerifier` | HMAC-SHA256 over the raw body; constant-time compare; fail-closed when `whatsapp.app-secret` is missing |
+| Incoming messages (`POST`) | `WhatsAppWebhookController.receiveWebhookEvent` | Validates signature, parses raw body with Jackson 3 `JsonMapper`; returns `401` invalid signature, `400` malformed JSON, `200` authenticated events |
 | Text replies | `SendMessageRequest` + `WhatsAppClient.sendTextMessage` | Basic text message |
 | Interactive lists | `SendInteractiveListRequest` + `WhatsAppClient.sendInteractiveList` | Up to 10 rows; used for menus and field selection |
 | Interactive reply buttons | `SendInteractiveButtonRequest` + `WhatsAppClient.sendInteractiveButtons` | Up to 3 buttons; used for `PACIENTE`/`CITA`, `SI`/`NO`, patient state |
 | WhatsApp Flow messages | Not present | The codebase currently uses lists/buttons, not Flows |
 | Template messages | Not implemented | `TemplateParameters` is an empty placeholder |
 
-> `[VERIFY IN CODE/ENV]` The exact Meta app configuration (app ID, app secret, webhook callback URL, subscribed fields, production phone number) is not stored in this repository.
+> `[VERIFY IN CODE/ENV]` The actual Meta app secret value, app ID, webhook callback URL, subscribed fields, and production phone number are external to this repository. The code expects `WHATSAPP_APP_SECRET` for POST signature validation.
 
 ---
 
@@ -88,6 +94,7 @@ WhatsAppClient
 | Java | 21 | `pom.xml` |
 | Spring Boot | 4.1.1 | `pom.xml` parent |
 | Web | `spring-boot-starter-webmvc` | `pom.xml` |
+| JSON | Jackson 3 (`tools.jackson.databind.json.JsonMapper`) via `spring-boot-starter-jackson` | Dependency tree |
 | Security | `spring-boot-starter-security` | `pom.xml` |
 | Persistence | `spring-boot-starter-data-jpa`, `spring-boot-starter-data-jdbc` | `pom.xml` |
 | Database | PostgreSQL (`org.postgresql:postgresql`) | `pom.xml` |
@@ -136,12 +143,15 @@ The Spring Boot artifact is the deployable backend. The Vue app and static site 
 │   │   │   └── Service/
 │   │   │       ├── WhatsAppBotService.java     # Main bot/state machine
 │   │   │       ├── WhatsAppClient.java         # Graph API client
+│   │   │       ├── WhatsAppSignatureVerifier.java # HMAC-SHA256 validation
 │   │   │       └── PatientService.java         # Patient CRUD service
 │   │   └── resources/
 │   │       ├── application.properties
 │   │       └── vue-project1/                   # Independent Vue app
 │   └── test/java/com/example/Project1/
-│       └── Project1ApplicationTests.java       # contextLoads() only
+│       ├── Project1ApplicationTests.java       # contextLoads()
+│       ├── Controller/WhatsAppWebhookControllerTest.java
+│       └── Service/WhatsAppSignatureVerifierTest.java
 ```
 
 ---
@@ -158,6 +168,7 @@ The Spring Boot artifact is the deployable backend. The Vue app and static site 
   - A WhatsApp phone number ID.
   - A permanent/temporary access token.
   - A webhook verify token.
+  - The Meta app secret (`WHATSAPP_APP_SECRET`) used for `X-Hub-Signature-256`.
 - A public HTTPS URL for webhook delivery. The CORS config anticipates `ngrok` domains (`https://*.ngrok-free.app`, `https://*.ngrok.io`).
 
 ### Required environment variables (backend)
@@ -170,6 +181,8 @@ These are referenced by `src/main/resources/application.properties` or `compose.
 | `WHATSAPP_PHONE_NUMBER_ID` | `application.properties` / `WhatsAppProperties` | Meta phone number ID |
 | `WHATSAPP_ACCESS_TOKEN` | `application.properties` / `WhatsAppProperties` | Graph API bearer token |
 | `WHATSAPP_VERIFY_TOKEN` | `application.properties` / `WhatsAppProperties` | Webhook verification token |
+| `WHATSAPP_APP_SECRET` | `application.properties` / `WhatsAppProperties` | Meta app secret for `X-Hub-Signature-256` HMAC validation |
+| `WHATSAPP_SIGNATURE_VERIFICATION_ENABLED` | `application.properties` / `WhatsAppProperties` | Optional dev toggle; defaults to `true` |
 | `DOCTOR_WHATSAPP_PHONE` | `application.properties` | Doctor's WhatsApp number (`whatsapp.doctor.phone-number`) |
 | `DATABASE_DB` | `compose.yaml` | PostgreSQL database name |
 | `PRODUCTION_USERNAME_DB` | `compose.yaml` | PostgreSQL user |
@@ -193,37 +206,24 @@ These are **not referenced** by the current `application.properties` or Java sou
 
 > `[VERIFY IN CODE/ENV]` Confirm which of these variables are still intended for local use.
 
-### Critical configuration binding caveat
+The new POST signature check expects `WHATSAPP_APP_SECRET`; add it to `.env` or your secret manager. If you cannot set it locally, set `WHATSAPP_SIGNATURE_VERIFICATION_ENABLED=false` for local development only.
 
-`application.properties` currently uses:
+### Configuration binding
+
+`application.properties` now uses keys that bind to `WhatsAppProperties`:
 
 ```properties
-whatsapp.api.url=...
-whatsapp.api.phone-number-id=...
-whatsapp.api.access-token=...
-whatsapp.api.verify-token=...
+whatsapp.api-url=https://graph.facebook.com/v21.0
+whatsapp.phone-number-id=${WHATSAPP_PHONE_NUMBER_ID}
+whatsapp.access-token=${WHATSAPP_ACCESS_TOKEN}
+whatsapp.verify-token=${WHATSAPP_VERIFY_TOKEN}
+whatsapp.app-secret=${WHATSAPP_APP_SECRET:}
+whatsapp.signature-verification-enabled=${WHATSAPP_SIGNATURE_VERIFICATION_ENABLED:true}
 ```
 
-But `WhatsAppProperties` declares:
+`WhatsAppProperties` still declares a default `apiUrl` of `https://graph.facebook.com/v26.0`, but the property above overrides it. The effective Graph API version is therefore `v21.0`.
 
-```java
-@ConfigurationProperties(prefix = "whatsapp")
-public class WhatsAppProperties {
-    private String apiUrl;
-    private String phoneNumberId;
-    private String accessToken;
-    private String verifyToken;
-    ...
-}
-```
-
-Spring Boot relaxed binding maps `whatsapp.api-url` to `apiUrl`, **not** `whatsapp.api.url`. The current nested keys may not bind to these fields, leaving the class defaults (`${WHATSAPP_PHONE_NUMBER_ID}`, etc.) as literal strings.
-
-> `[VERIFY IN CODE/ENV]` Reconcile these property names before relying on outbound Meta calls. Either change `application.properties` to `whatsapp.api-url`, `whatsapp.phone-number-id`, `whatsapp.access-token`, `whatsapp.verify-token`, or refactor `WhatsAppProperties` to a nested `Api` object.
-
-Also note: `application.properties` sets the Graph API base to `https://graph.facebook.com/v21.0`, while `WhatsAppProperties` defaults to `https://graph.facebook.com/v26.0`.
-
-> `[VERIFY IN CODE/ENV]` Confirm which API version is intended.
+> `[VERIFY IN CODE/ENV]` Confirm `v21.0` is the intended Meta API version for this app.
 
 ### Database
 
@@ -264,13 +264,16 @@ $env:SPRING_DATASOURCE_URL = "jdbc:postgresql://localhost:5433/<database>"
 $env:WHATSAPP_PHONE_NUMBER_ID = "<meta-phone-number-id>"
 $env:WHATSAPP_ACCESS_TOKEN  = "<meta-access-token>"
 $env:WHATSAPP_VERIFY_TOKEN  = "<webhook-verify-token>"
+$env:WHATSAPP_APP_SECRET    = "<meta-app-secret>"
 $env:DOCTOR_WHATSAPP_PHONE  = "<doctor-whatsapp-number>"
+# Local-only option if you do not have the Meta app secret yet:
+# $env:WHATSAPP_SIGNATURE_VERIFICATION_ENABLED = "false"
 
 # 3. Run the backend
 .\mvnw.cmd spring-boot:run
 ```
 
-Spring Boot does **not** read `.env` automatically. Export variables in your shell or configure them in your IDE/run configuration.
+No code in this repository loads `.env`; export variables in your shell or configure them in your IDE/run configuration.
 
 ### Run locally (Unix-like shell)
 
@@ -281,7 +284,10 @@ export SPRING_DATASOURCE_URL="jdbc:postgresql://localhost:5433/<database>"
 export WHATSAPP_PHONE_NUMBER_ID="<meta-phone-number-id>"
 export WHATSAPP_ACCESS_TOKEN="<meta-access-token>"
 export WHATSAPP_VERIFY_TOKEN="<webhook-verify-token>"
+export WHATSAPP_APP_SECRET="<meta-app-secret>"
 export DOCTOR_WHATSAPP_PHONE="<doctor-whatsapp-number>"
+# Local-only option if you do not have the Meta app secret yet:
+# export WHATSAPP_SIGNATURE_VERIFICATION_ENABLED="false"
 
 ./mvnw spring-boot:run
 ```
@@ -297,6 +303,7 @@ docker run --rm -p 8080:8080 \
   -e WHATSAPP_PHONE_NUMBER_ID="<meta-phone-number-id>" \
   -e WHATSAPP_ACCESS_TOKEN="<meta-access-token>" \
   -e WHATSAPP_VERIFY_TOKEN="<webhook-verify-token>" \
+  -e WHATSAPP_APP_SECRET="<meta-app-secret>" \
   -e DOCTOR_WHATSAPP_PHONE="<doctor-whatsapp-number>" \
   dentalbot
 ```
@@ -314,10 +321,11 @@ The Dockerfile builds with `./mvnw clean package -DskipTests`, runs as a non-roo
    https://<public-host>/api/whatsapp/webhook
    ```
 3. Set the verify token to the same value as `WHATSAPP_VERIFY_TOKEN`.
-4. Subscribe to the `messages` webhook field (the code reads `change.value.messages`).
-5. Send a WhatsApp message to the business number and confirm the webhook logs.
+4. Set `WHATSAPP_APP_SECRET` to the Meta app secret. The POST handler validates `X-Hub-Signature-256`; invalid signatures return `401`.
+5. Subscribe to the `messages` webhook field (the code reads `change.value.messages`).
+6. Send a WhatsApp message to the business number and confirm the webhook logs.
 
-> `[VERIFY IN CODE/ENV]` The exact Meta app/webhook configuration and production hostname are external to this repository.
+> `[VERIFY IN CODE/ENV]` The exact Meta app/webhook configuration, app secret value, and production hostname are external to this repository.
 
 ### Vue frontend (separate)
 
@@ -351,7 +359,23 @@ Useful scripts from `package.json`:
 
 On Windows, substitute `.\mvnw.cmd`.
 
-Current backend test coverage is minimal: the only test is `Project1ApplicationTests.contextLoads()`. Because it uses `@SpringBootTest`, it boots the full application context and needs the datasource configuration to be resolvable.
+Current backend tests:
+
+- `Project1ApplicationTests.contextLoads()` boots the full application context and needs the datasource configuration to be resolvable.
+- `WhatsAppSignatureVerifierTest` covers valid, invalid, missing, and malformed `X-Hub-Signature-256` values.
+- `WhatsAppWebhookControllerTest` covers `401`, `400`, and `200` behavior with `MockMvc`.
+
+Run only the signature-related tests without a database:
+
+```bash
+./mvnw -Dtest=WhatsAppSignatureVerifierTest,WhatsAppWebhookControllerTest test
+```
+
+On Windows:
+
+```powershell
+.\mvnw.cmd "-Dtest=WhatsAppSignatureVerifierTest,WhatsAppWebhookControllerTest" test
+```
 
 ---
 
@@ -362,7 +386,7 @@ Current backend test coverage is minimal: the only test is `Project1ApplicationT
 | Method | Path | Behavior |
 |---|---|---|
 | `GET` | `/api/whatsapp/webhook` | Meta verification. Requires `hub.mode=subscribe` and a matching `hub.verify_token`; returns `hub.challenge` or `403`. |
-| `POST` | `/api/whatsapp/webhook` | Receives Meta events. Calls `WhatsAppBotService.processWebhookEvent`, logs exceptions, and always returns `200 EVENT_RECEIVED`. |
+| `POST` | `/api/whatsapp/webhook` | Validates `X-Hub-Signature-256` with `WhatsAppSignatureVerifier`, parses the raw body with Jackson 3, and calls `WhatsAppBotService.processWebhookEvent`. Returns `401` for invalid signatures, `400` for malformed JSON, and `200` for authenticated events. |
 
 ### Incoming payload handling
 
@@ -372,6 +396,8 @@ Current backend test coverage is minimal: the only test is `Project1ApplicationT
 
 - `getExtractedText()`: returns `text.body`, or the title of an interactive list/button reply.
 - `getInteractiveSelectionId()`: returns the selected list/button ID.
+
+Before parsing, `receiveWebhookEvent` receives the raw `byte[]` body and the `X-Hub-Signature-256` header. `WhatsAppSignatureVerifier` computes HMAC-SHA256 using `whatsapp.app-secret` and compares in constant time. If `whatsapp.signature-verification-enabled=false`, the check is skipped for local development. After validation, the auto-configured Jackson 3 `JsonMapper` parses the same bytes into `WhatsAppWebhookPayload`.
 
 The bot processes each message as follows:
 
@@ -502,8 +528,8 @@ This doctor state is **not persisted**. It is lost on application restart and is
 ./mvnw test
 ```
 
-- Only `Project1ApplicationTests.contextLoads()` is present.
-- It starts the full Spring context, so the datasource configuration must be resolvable.
+- `Project1ApplicationTests.contextLoads()` starts the full Spring context, so the datasource configuration must be resolvable.
+- `WhatsAppSignatureVerifierTest` and `WhatsAppWebhookControllerTest` cover signature validation and webhook status codes.
 - There are no bot-flow integration tests yet.
 
 ### Common pitfalls
@@ -511,14 +537,15 @@ This doctor state is **not persisted**. It is lost on application restart and is
 | Symptom | Likely cause | What to check |
 |---|---|---|
 | Webhook verification returns `403` | Token mismatch | `WHATSAPP_VERIFY_TOKEN` must equal the Meta dashboard verify token |
-| Outbound Meta calls fail or use placeholder values | `whatsapp.api.*` keys do not bind to `WhatsAppProperties` | Reconcile property names; see the configuration caveat above |
+| Outbound Meta calls fail or use placeholder values | Missing or wrong Meta credentials | Confirm `whatsapp.api-url`, `whatsapp.phone-number-id`, `whatsapp.access-token`, and `whatsapp.verify-token` are set and bound |
 | Outbound Meta calls fail with an auth/permission error | Meta access token expired or invalid | Refresh `WHATSAPP_ACCESS_TOKEN` and restart the app |
+| Every POST returns `401` | Signature verification enabled but `WHATSAPP_APP_SECRET` is missing or wrong | Set the Meta app secret, or set `WHATSAPP_SIGNATURE_VERIFICATION_ENABLED=false` locally |
 | Data disappears after restart | `spring.jpa.hibernate.ddl-auto=create-drop` | Use migrations and a non-destructive setting for production |
 | Doctor commands do not trigger | `DOCTOR_WHATSAPP_PHONE` does not exactly match the incoming `from` value | Confirm the international number format used by Meta |
 | Doctor multi-step flow resets | Doctor session state is in-memory | Restart clears `DoctorSession`; do not scale horizontally without moving state to a shared store |
 | Pending date confirmation is lost | `isWaitingDate` is a single in-memory boolean | Restart or concurrent doctor messages can reset/overwrite it |
-| Duplicate replies for one Meta event | Controller always returns `200`; no idempotency check | Implement `WhatsAppWebhookEvent.eventKey` deduplication |
-| Webhook spoofing risk | No `X-Hub-Signature-256` validation | Add app-secret signature verification before production |
+| Duplicate replies for one Meta event | Authenticated events return `200`; no idempotency check | Implement `WhatsAppWebhookEvent.eventKey` deduplication |
+| Webhook signature mismatch | Wrong app secret, altered/re-encoded body, or a proxy changing the payload | Ensure the raw body reaches the app unchanged; verify `WHATSAPP_APP_SECRET` |
 | REST API is publicly readable/writable | `SecurityConfig` permits all requests | Add authentication/authorization before production |
 | `Cobrar` flow behaves unexpectedly | Legacy PAGO interaction has no dedicated state machine | Review `handleLegacyTreatmentSelection` before relying on it |
 | Treatment list fails to map | Native query returns `SendInteractiveListRequest.Row` | `[VERIFY IN CODE/ENV]` the native projection against the PostgreSQL schema |
@@ -527,17 +554,38 @@ This doctor state is **not persisted**. It is lost on application restart and is
 
 ### Security notes
 
+- Webhook `POST` requests are authenticated with `X-Hub-Signature-256` (HMAC-SHA256) via `WhatsAppSignatureVerifier`; invalid signatures return `401`.
+- Signature validation is fail-closed by default. The dev toggle `WHATSAPP_SIGNATURE_VERIFICATION_ENABLED=false` must never be used in production.
 - `SecurityConfig` disables CSRF and permits **all** requests.
 - CORS allows `http://localhost:*`, `https://*.ngrok-free.app`, and `https://*.ngrok.io`.
 - `PatientController` and `AppointmentController` add local dev `@CrossOrigin` origins (`localhost:5173`, `:3000`, `:5157`).
-- There is **no webhook signature verification** and **no REST API authentication**.
-- These choices are suitable for local development only. Do not deploy as-is.
+- The REST API still has **no authentication**, and CSRF is disabled. Harden these before production.
+- These choices are suitable for local development except for the webhook signature check, which is production-oriented.
 
 ---
 
 ## Architectural Decision Records (ADRs)
 
 > No formal `docs/` or `adr/` directory exists in this repository. The records below are **inferred from the codebase** and describe the patterns that future contributors and AI assistants must preserve unless they intentionally replace them.
+
+### ADR Index
+
+| ADR | Title | Status |
+|---|---|---|
+| ADR-0001 | Layered Spring Boot Monolith | Inferred from Codebase |
+| ADR-0002 | Webhook-First Meta Integration with `RestClient` | Inferred from Codebase |
+| ADR-0003 | Hybrid Conversation State | Inferred from Codebase |
+| ADR-0004 | Doctor Identity by Configured Phone Number | Inferred from Codebase |
+| ADR-0005 | Interactive Lists and Buttons Instead of Flows | Inferred from Codebase |
+| ADR-0006 | Permissive REST Security with Signed Webhooks | Inferred from Codebase |
+| ADR-0007 | PostgreSQL + Hibernate `create-drop` for Development | Inferred from Codebase |
+| ADR-0008 | Configuration via Environment Placeholders | Inferred from Codebase |
+| ADR-0009 | Broad Domain Model, Narrow Runtime Usage | Inferred from Codebase |
+| ADR-0010 | Auxiliary Frontends Outside the Backend Artifact | Inferred from Codebase |
+| ADR-0011 | Immediate vs Deferred Persistence | Inferred from Codebase |
+| ADR-0012 | In-Memory Search Over `findAll` | Inferred from Codebase |
+| ADR-0013 | No Idempotency or Retry Enforcement (Open) | Inferred from Codebase |
+| ADR-0014 | Webhook HMAC-SHA256 Signature Validation | Accepted |
 
 ### ADR-0001: Layered Spring Boot Monolith
 
@@ -559,7 +607,7 @@ This doctor state is **not persisted**. It is lost on application restart and is
   - A publicly reachable HTTPS endpoint is required.
   - Verify-token handling is mandatory for Meta registration.
   - Outbound credentials and phone number ID must be valid.
-  - The current code does not validate webhook signatures; do not assume the request is authentic without adding that check.
+  - POST authenticity is handled separately by HMAC-SHA256 signature validation (ADR-0014); the GET verify token is not a substitute for it.
 
 ### ADR-0003: Hybrid Conversation State
 
@@ -596,15 +644,18 @@ This doctor state is **not persisted**. It is lost on application restart and is
   - Keep interactive IDs stable and unique.
   - The webhook parser must handle both `interactive.list_reply` and `interactive.button_reply`.
 
-### ADR-0006: Permissive Development Security
+### ADR-0006: Permissive REST Security with Signed Webhooks
 
 - **Status:** Inferred from Codebase
-- **Context:** The project is developed locally with a Vue frontend and ngrok-exposed webhooks.
-- **Decision:** `SecurityConfig` disables CSRF, permits all requests, and allows localhost/ngrok CORS origins. Controllers add local `@CrossOrigin` origins.
+- **Context:** The project is developed locally with a Vue frontend and ngrok-exposed webhooks. Meta POSTs must be authenticated independently of Spring Security.
+- **Decision:**
+  - `SecurityConfig` disables CSRF, permits all requests, and allows localhost/ngrok CORS origins. Controllers add local `@CrossOrigin` origins.
+  - Webhook POSTs are authenticated by `WhatsAppSignatureVerifier` using HMAC-SHA256 over the raw body (ADR-0014).
 - **Consequences:**
-  - This is a development posture, not a production security model.
-  - Before production: add authentication/authorization, restrict origins, validate webhook signatures, and define a CSRF strategy.
-  - Do not expose the REST API or webhook publicly without these controls.
+  - The webhook has a production-oriented authenticity check.
+  - The REST API still has no authentication/authorization, CSRF is disabled, and CORS is development-oriented.
+  - Before production: add REST authentication/authorization, restrict origins, and define a CSRF strategy.
+  - Do not expose the REST API publicly without these controls.
 
 ### ADR-0007: PostgreSQL + Hibernate `create-drop` for Development
 
@@ -623,8 +674,8 @@ This doctor state is **not persisted**. It is lost on application restart and is
 - **Decision:** Use `${ENV_VAR}` placeholders in `application.properties`, bind `whatsapp.*` in `WhatsAppProperties`, and keep `.env` gitignored.
 - **Consequences:**
   - No code in this repository loads `.env`; export variables or use Docker Compose's `.env` interpolation.
-  - The current `whatsapp.api.*` keys do not match the `WhatsAppProperties` field names; reconcile them before deployment.
-  - Never commit real tokens or passwords.
+  - Property keys are aligned with `WhatsAppProperties`: `whatsapp.api-url`, `whatsapp.phone-number-id`, `whatsapp.access-token`, `whatsapp.verify-token`, `whatsapp.app-secret`, and `whatsapp.signature-verification-enabled`.
+  - Never commit real tokens, app secrets, or passwords.
 
 ### ADR-0009: Broad Domain Model, Narrow Runtime Usage
 
@@ -670,18 +721,32 @@ This doctor state is **not persisted**. It is lost on application restart and is
 ### ADR-0013: No Idempotency or Retry Enforcement (Open)
 
 - **Status:** Inferred from Codebase
-- **Context:** The webhook controller always acknowledges events with `200` and does not deduplicate them; `WhatsAppWebhookEvent.eventKey` is modeled with a unique constraint but is never checked.
-- **Decision:** The webhook controller catches exceptions, logs them, and always returns `200`. `WhatsAppWebhookEvent.eventKey` exists with a unique constraint but is not used. `WhatsAppClient` does not retry.
+- **Context:** The webhook controller acknowledges authenticated events with `200` and does not deduplicate them; `WhatsAppWebhookEvent.eventKey` is modeled with a unique constraint but is never checked.
+- **Decision:** Invalid signatures return `401` and malformed JSON returns `400` before processing. Authenticated events still return `200` even if bot processing fails. `WhatsAppWebhookEvent.eventKey` exists with a unique constraint but is not used. `WhatsAppClient` does not retry.
 - **Consequences:**
   - Duplicate processing is possible.
   - Transient Graph API failures are not retried.
   - Before production: add event deduplication via `WhatsAppWebhookEvent.eventKey`, retry/backoff, and observability.
 
+### ADR-0014: Webhook HMAC-SHA256 Signature Validation
+
+- **Status:** Accepted
+- **Context:** Meta POSTs must be authenticated. The previous controller deserialized the body immediately and always returned `200`, so any caller could submit a payload.
+- **Decision:**
+  - `WhatsAppWebhookController.receiveWebhookEvent` accepts the raw `byte[]` body and the `X-Hub-Signature-256` header.
+  - `WhatsAppSignatureVerifier` computes HMAC-SHA256 with `whatsapp.app-secret` and compares using `MessageDigest.isEqual`.
+  - Invalid or missing signatures return `401`; malformed JSON returns `400`; authenticated processing failures return `200`.
+  - Verification is enabled by default and fails closed when the secret is missing. `whatsapp.signature-verification-enabled=false` is a local-development escape hatch only.
+- **Consequences:**
+  - The raw body must not be modified or re-encoded before verification.
+  - Proxies must preserve the exact request body.
+  - `WHATSAPP_APP_SECRET` must be provisioned in every environment where POSTs are accepted.
+  - Signature validation does not provide replay protection or idempotency; those remain part of ADR-0013.
+
 ### Proposed / Open ADR Topics
 
 The following decisions should be recorded next:
 
-- Webhook signature verification and app-secret management.
 - Idempotent webhook processing and retry/backoff policy.
 - Shared persistent storage for doctor conversation state (DB/Redis).
 - Multi-doctor/multi-tenant authentication and authorization.
@@ -691,7 +756,7 @@ The following decisions should be recorded next:
 - Graph API rate limiting, circuit breaking, and dead-letter handling.
 - Observability: structured logging, metrics, tracing, and alerting.
 - Test strategy for bot flows and webhook parsing.
-- Fixing the `whatsapp.api.*` vs `whatsapp.api-url` configuration mismatch.
+- Secret rotation and storage policy for `WHATSAPP_APP_SECRET`.
 - Verifying the native treatment-list projection used by the `Cobrar` flow.
 
 ---
@@ -702,7 +767,7 @@ The following decisions should be recorded next:
 - Do not bypass `WhatsAppBotService` from controllers for bot behavior.
 - Preserve patient state transitions and null-safety around optional entity fields.
 - Treat the doctor menu/update/registration flows as state machines; add tests when changing transitions.
-- Never commit `.env`, access tokens, verify tokens, or database passwords.
+- Never commit `.env`, access tokens, verify tokens, app secrets, or database passwords.
 - For backend changes, run:
   ```bash
   ./mvnw -DskipTests compile
@@ -722,10 +787,10 @@ The following decisions should be recorded next:
 
 Confirm these items before deploying or extending the system:
 
-- The exact Meta app configuration (app ID, app secret, callback URL, subscribed fields, production phone number).
-- Which Meta Graph API version is intended: `v21.0` in `application.properties` vs `v26.0` in `WhatsAppProperties`.
-- The correct property-key strategy for `whatsapp.api.*` vs `whatsapp.api-url`, `whatsapp.phone-number-id`, etc.
+- The exact Meta app configuration (app ID, app secret value, callback URL, subscribed fields, production phone number).
+- Which Meta Graph API version is intended: the effective value is `v21.0` from `application.properties`; `WhatsAppProperties` still has a `v26.0` default.
 - Whether `USERNAME_DB`, `PASSWORD_DB`, `PORT_DB`, `WHATSAPP_BUSINESS_PHONE_NUMBER_ID`, and `WHATSAPP_FLOW_*` in `.env` are still used locally.
+- Whether a production secret-rotation/storage policy exists for `WHATSAPP_APP_SECRET`.
 - The exact international format of `DOCTOR_WHATSAPP_PHONE` expected by the current Meta account.
 - Whether the native `getAllTreatmentsIgnoreCase` query maps correctly to `SendInteractiveListRequest.Row` in the target PostgreSQL schema.
 - Whether the unmapped entities (`MessageThread`, `Message`, `BotCommand`, `Notification`, `WhatsAppTemplate`, `WhatsAppWebhookEvent`) are planned for future features.

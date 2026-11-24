@@ -11,6 +11,8 @@ public class WhatsAppProperties {
     private String phoneNumberId = "${WHATSAPP_PHONE_NUMBER_ID}";
     private String accessToken = "${WHATSAPP_ACCESS_TOKEN}";
     private String verifyToken = "${WHATSAPP_VERIFY_TOKEN}";
+    private String appSecret;
+    private boolean signatureVerificationEnabled = true;
     private Doctor doctor = new Doctor();
 
     public static class Doctor {
@@ -55,6 +57,22 @@ public class WhatsAppProperties {
 
     public void setVerifyToken(String verifyToken) {
         this.verifyToken = verifyToken;
+    }
+
+    public String getAppSecret() {
+        return appSecret;
+    }
+
+    public void setAppSecret(String appSecret) {
+        this.appSecret = appSecret;
+    }
+
+    public boolean isSignatureVerificationEnabled() {
+        return signatureVerificationEnabled;
+    }
+
+    public void setSignatureVerificationEnabled(boolean signatureVerificationEnabled) {
+        this.signatureVerificationEnabled = signatureVerificationEnabled;
     }
 
     public Doctor getDoctor() {
