@@ -59,6 +59,17 @@ public class Appointment {
     @Column
     private Timestamp dateConfirmationRequestedAt;
 
+    /**
+     * Patient reminder response state. Kept separate from appointmentStatus so
+     * the doctor's date confirmation is not overwritten by the patient's answer.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private PatientConfirmationStatus patientConfirmationStatus = PatientConfirmationStatus.PENDING;
+
+    @Column
+    private Timestamp patientRespondedAt;
+
     @Column
     private LocalDateTime appointmentDateTime;
 
@@ -205,5 +216,32 @@ public class Appointment {
 
     public void setDateConfirmationRequestedAt(Timestamp dateConfirmationRequestedAt) {
         this.dateConfirmationRequestedAt = dateConfirmationRequestedAt;
+    }
+
+    public PatientConfirmationStatus getPatientConfirmationStatus() {
+        return patientConfirmationStatus;
+    }
+
+    public void setPatientConfirmationStatus(PatientConfirmationStatus patientConfirmationStatus) {
+        this.patientConfirmationStatus = patientConfirmationStatus;
+    }
+
+    public Timestamp getPatientRespondedAt() {
+        return patientRespondedAt;
+    }
+
+    public void setPatientRespondedAt(Timestamp patientRespondedAt) {
+        this.patientRespondedAt = patientRespondedAt;
+    }
+
+    /**
+     * Single scheduling source of truth. startAppointmentAt is set by the
+     * doctor-date flow; appointmentDateTime remains a fallback for older data.
+     */
+    public LocalDateTime resolveScheduledAt() {
+        if (startAppointmentAt != null) {
+            return startAppointmentAt.toLocalDateTime();
+        }
+        return appointmentDateTime;
     }
 }

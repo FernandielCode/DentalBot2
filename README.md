@@ -32,13 +32,14 @@ The bot serves two audiences:
 - `WhatsAppBotService` decides whether the sender is the configured doctor or a patient.
 - Patients follow a persisted, multi-message intake flow that creates a `Patient` and a pending `Appointment`.
 - The doctor gets a WhatsApp menu with search, update, charge, patient-list, and patient-registration actions.
+- Once the doctor sets a date, the bot schedules a 3-day and a 1-day patient reminder. Patients can tap **Confirmar** or **Cancelar**.
 - Outbound replies are sent through `WhatsAppClient` to the Graph API endpoint `/{phone-number-id}/messages`.
 
 ### What it does **not** currently use
 
 - No WhatsApp Flows DTOs or flow JSON resources are present in the current codebase.
 - No WebSocket/messaging dependency is used.
-- No template-message sending is implemented (`TemplateParameters` is an empty record).
+- No inbound template-creation/approval automation is implemented; approved templates are still managed in Meta Business Manager.
 - No Flyway/Liquibase migration tool is present.
 
 ### High-level request flow
@@ -68,6 +69,8 @@ WhatsAppClient
         └─ POST https://graph.facebook.com/.../{phoneNumberId}/messages
 ```
 
+Patient reminder replies are routed to `AppointmentConfirmationService` before the intake state machine. A separate scheduler (`AppointmentReminderScheduler`) sends due reminders from `appointment_reminders`; it runs outside the webhook request path.
+
 ### WhatsApp integration surface
 
 | Surface | Implemented in | Notes |
@@ -79,7 +82,7 @@ WhatsAppClient
 | Interactive lists | `SendInteractiveListRequest` + `WhatsAppClient.sendInteractiveList` | Up to 10 rows; used for menus and field selection |
 | Interactive reply buttons | `SendInteractiveButtonRequest` + `WhatsAppClient.sendInteractiveButtons` | Up to 3 buttons; used for `PACIENTE`/`CITA`, `SI`/`NO`, patient state |
 | WhatsApp Flow messages | Not present | The codebase currently uses lists/buttons, not Flows |
-| Template messages | Not implemented | `TemplateParameters` is an empty placeholder |
+| Template messages | `SendTemplateMessageRequest` + `WhatsAppClient.sendTemplateMessage` | Used for proactive reminders; the template must be approved in Meta Business Manager |
 
 > `[VERIFY IN CODE/ENV]` The actual Meta app secret value, app ID, webhook callback URL, subscribed fields, and production phone number are external to this repository. The code expects `WHATSAPP_APP_SECRET` for POST signature validation.
 
@@ -186,6 +189,15 @@ These are referenced by `src/main/resources/application.properties` or `compose.
 | `WHATSAPP_APP_SECRET` | `application.properties` / `WhatsAppProperties` | Meta app secret for `X-Hub-Signature-256` HMAC validation |
 | `WHATSAPP_SIGNATURE_VERIFICATION_ENABLED` | `application.properties` / `WhatsAppProperties` | Optional dev toggle; defaults to `true` |
 | `DOCTOR_WHATSAPP_PHONE` | `application.properties` | Doctor's WhatsApp number (`whatsapp.doctor.phone-number`) |
+| `REMINDER_ENABLED` | `application.properties` | Enables/disables appointment reminders |
+| `REMINDER_ZONE` | `application.properties` | Clinic timezone; default `America/Guayaquil` |
+| `REMINDER_SEND_TIME` | `application.properties` | Reminder send time in clinic time; default `09:00` |
+| `REMINDER_TEMPLATE_NAME` | `application.properties` | Approved Meta template name for reminders |
+| `REMINDER_TEMPLATE_LANGUAGE` | `application.properties` | Template language code; default `es` |
+| `REMINDER_TEMPLATE_CLINIC_NAME` | `application.properties` | Clinic name used as a template body parameter |
+| `REMINDER_TEMPLATE_CONFIRM_LABEL` | `application.properties` | Confirm quick-reply label; default `Confirmar` |
+| `REMINDER_TEMPLATE_CANCEL_LABEL` | `application.properties` | Cancel quick-reply label; default `Cancelar` |
+| `REMINDER_TEMPLATE_ENABLED` | `application.properties` | Use approved templates; set `false` for local interactive-button fallback |
 | `DATABASE_DB` | `compose.yaml` | PostgreSQL database name |
 | `PRODUCTION_USERNAME_DB` | `compose.yaml` | PostgreSQL user |
 | `PRODUCTION_PASSWORD_DB` | `compose.yaml` | PostgreSQL password |
@@ -226,6 +238,27 @@ whatsapp.signature-verification-enabled=${WHATSAPP_SIGNATURE_VERIFICATION_ENABLE
 `WhatsAppProperties` still declares a default `apiUrl` of `https://graph.facebook.com/v26.0`, but the property above overrides it. The effective Graph API version is therefore `v21.0`.
 
 > `[VERIFY IN CODE/ENV]` Confirm `v21.0` is the intended Meta API version for this app.
+
+Reminder settings bind to `ReminderProperties`:
+
+```properties
+app.reminders.enabled=${REMINDER_ENABLED:true}
+app.reminders.zone=${REMINDER_ZONE:America/Guayaquil}
+app.reminders.send-time=${REMINDER_SEND_TIME:09:00}
+app.reminders.batch-size=${REMINDER_BATCH_SIZE:50}
+app.reminders.max-attempts=${REMINDER_MAX_ATTEMPTS:3}
+app.reminders.claim-timeout-minutes=${REMINDER_CLAIM_TIMEOUT_MINUTES:10}
+app.reminders.poll-interval-ms=${REMINDER_POLL_INTERVAL_MS:60000}
+app.reminders.rebuild-cron=${REMINDER_REBUILD_CRON:0 15 0 * * *}
+app.reminders.template.enabled=${REMINDER_TEMPLATE_ENABLED:true}
+app.reminders.template.name=${REMINDER_TEMPLATE_NAME:appointment_reminder_es}
+app.reminders.template.language=${REMINDER_TEMPLATE_LANGUAGE:es}
+app.reminders.template.clinic-name=${REMINDER_TEMPLATE_CLINIC_NAME:Dental Clinic}
+app.reminders.template.confirm-label=${REMINDER_TEMPLATE_CONFIRM_LABEL:Confirmar}
+app.reminders.template.cancel-label=${REMINDER_TEMPLATE_CANCEL_LABEL:Cancelar}
+```
+
+The production template must be approved in Meta Business Manager and contain two quick-reply buttons with the configured labels. For local development without an approved template, set `REMINDER_TEMPLATE_ENABLED=false`; the bot then uses interactive buttons and logs simulated sends when Meta credentials are absent.
 
 ### Database
 
@@ -366,18 +399,21 @@ Current backend tests:
 - `Project1ApplicationTests.contextLoads()` boots the full application context and needs the datasource configuration to be resolvable.
 - `WhatsAppSignatureVerifierTest` covers valid, invalid, missing, and malformed `X-Hub-Signature-256` values.
 - `WhatsAppWebhookControllerTest` covers `401`, `400`, and `200` behavior with `MockMvc`.
+- `WhatsAppWebhookPayloadTest` covers template quick-reply parsing and `context.id`.
 - `WhatsAppBotServiceDateConfirmationTest` verifies that the doctor's selected appointment is persisted and that only that appointment is confirmed.
+- `AppointmentReminderServiceTest` covers reminder creation, short-notice skipping, delivery state, and the rule that a confirmed patient still receives the later 1-day reminder.
+- `AppointmentConfirmationServiceTest` covers Confirmar/Cancelar, phone ownership checks, and doctor cancellation alerts.
 
 Run the unit tests without a database:
 
 ```bash
-./mvnw -Dtest=WhatsAppSignatureVerifierTest,WhatsAppWebhookControllerTest,WhatsAppBotServiceDateConfirmationTest test
+./mvnw -Dtest=WhatsAppSignatureVerifierTest,WhatsAppWebhookControllerTest,WhatsAppWebhookPayloadTest,WhatsAppBotServiceDateConfirmationTest,AppointmentReminderServiceTest,AppointmentConfirmationServiceTest test
 ```
 
 On Windows:
 
 ```powershell
-.\mvnw.cmd "-Dtest=WhatsAppSignatureVerifierTest,WhatsAppWebhookControllerTest,WhatsAppBotServiceDateConfirmationTest" test
+.\mvnw.cmd "-Dtest=WhatsAppSignatureVerifierTest,WhatsAppWebhookControllerTest,WhatsAppWebhookPayloadTest,WhatsAppBotServiceDateConfirmationTest,AppointmentReminderServiceTest,AppointmentConfirmationServiceTest" test
 ```
 
 ---
@@ -397,8 +433,9 @@ On Windows:
 
 `WhatsAppWebhookPayload.IncomingMessage` exposes:
 
-- `getExtractedText()`: returns `text.body`, or the title of an interactive list/button reply.
-- `getInteractiveSelectionId()`: returns the selected list/button ID.
+- `getExtractedText()`: returns `text.body`, the title of an interactive list/button reply, or the template quick-reply payload/text.
+- `getInteractiveSelectionId()`: returns the selected list/button ID or template quick-reply payload.
+- `getContextMessageId()`: returns `context.id`, the message id a user replied to. Template reminder replies use this to identify the exact reminder.
 
 Before parsing, `receiveWebhookEvent` receives the raw `byte[]` body and the `X-Hub-Signature-256` header. `WhatsAppSignatureVerifier` computes HMAC-SHA256 using `whatsapp.app-secret` and compares in constant time. If `whatsapp.signature-verification-enabled=false`, the check is skipped for local development. After validation, the auto-configured Jackson 3 `JsonMapper` parses the same bytes into `WhatsAppWebhookPayload`.
 
@@ -407,7 +444,8 @@ The bot processes each message as follows:
 1. Creates or updates a `WhatsAppContact` by `wa_id`.
 2. Saves the incoming message in `whatsapp_messages`.
 3. If `from` equals `whatsapp.doctor.phone-number`, routes to `handleDoctorMessage`.
-4. Otherwise, runs the patient intake state machine.
+4. If the message is a template quick reply or a reminder interactive button, routes to `AppointmentConfirmationService`.
+5. Otherwise, runs the patient intake state machine.
 
 ### Patient intake state machine
 
@@ -446,7 +484,30 @@ The doctor is identified by exact match against `DOCTOR_WHATSAPP_PHONE`.
   - `contextJSON = <appointmentId>`
 - The doctor's next date text updates that exact appointment, clears `awaitingDateConfirmation`, and clears the doctor's saved selection.
 - If the doctor types a date without selecting an appointment, the bot shows the waiting list instead of guessing.
+- After the date is set, the bot resets the patient confirmation state and schedules/refreshes the 3-day and 1-day reminders.
 - Both the appointment flag and the doctor's selected appointment survive application restarts.
+
+### Patient reminders and one-tap confirmation
+
+- Reminders are persisted in `appointment_reminders`, one row per appointment and reminder type.
+- `AppointmentReminderScheduler` polls due rows, claims them under a write lock, and sends them outside the claim transaction.
+- The 3-day and 1-day reminders are sent at `app.reminders.send-time` in `app.reminders.zone`.
+- Short-notice appointments only receive reminders whose scheduled time is still in the future.
+- After a successful reminder, the appointment moves to `WAITING_PATIENT_ANSWER` so the clinic can track non-responses.
+- A patient confirmation at the 3-day reminder **does not cancel** the 1-day reminder. The later reminder is still sent as a safety net.
+- Tapping **Confirmar** sets `patientConfirmationStatus = CONFIRMED` and records `patientRespondedAt`.
+- Tapping **Cancelar** sets `patientConfirmationStatus = CANCELLED`, sets `appointmentStatus = CANCELLED`, cancels open reminders, and notifies the doctor.
+- A patient can cancel after confirming. Repeated Confirmar/Cancelar taps are handled idempotently.
+- Only the phone registered on the appointment may confirm or cancel it.
+- Delivery retries follow `app.reminders.max-attempts`; stale `SENDING` claims are requeued after `app.reminders.claim-timeout-minutes`.
+- The nightly rebuild job creates missing reminders for appointments created or changed outside the bot; it never resets an already `SENT` row.
+
+Production template requirement:
+
+- Create/approve a utility template in Meta Business Manager with body parameters for patient name, clinic name, and appointment date.
+- Add two quick-reply buttons (for example, `Confirmar` and `Cancelar`).
+- Set `REMINDER_TEMPLATE_NAME`, `REMINDER_TEMPLATE_LANGUAGE`, and the button labels in the environment.
+- The code sends only the body parameters; Meta stores the approved template and its buttons.
 
 ### Doctor conversation states (mostly in-memory)
 
@@ -514,7 +575,8 @@ The exception is the date-confirmation selection: the selected appointment id is
 | Table | Entity | Active in current bot logic? |
 |---|---|---|
 | `patients` | `Patient` | Yes |
-| `appointments` | `Appointment` | Yes (includes `awaitingDateConfirmation` and `dateConfirmationRequestedAt`) |
+| `appointments` | `Appointment` | Yes (includes date confirmation and patient confirmation fields) |
+| `appointment_reminders` | `AppointmentReminder` | Yes (3-day/1-day delivery state, retries, provider message ids) |
 | `dentists` | `Dentist` | Yes (active dentist lookup, update validation) |
 | `treatments` | `Treatments` | Yes (list/price lookup, update validation) |
 | `appointment_treatments` | Join table | Yes |
@@ -528,17 +590,47 @@ The exception is the date-confirmation selection: the selected appointment id is
 | `whatsapp_templates` | `WhatsAppTemplate` | Modeled; no bot/controller references found |
 | `whatsapp_webhook_events` | `WhatsAppWebhookEvent` | Modeled; no bot/controller references found |
 
-The date-confirmation workflow state lives in two places:
+The date-confirmation and reminder state lives in:
 
-- `appointments.awaiting_date_confirmation` and `appointments.date_confirmation_requested_at` — which appointments are waiting.
+- `appointments.awaiting_date_confirmation` and `appointments.date_confirmation_requested_at` — which appointments are waiting for a doctor date.
+- `appointments.patient_confirmation_status` and `appointments.patient_responded_at` — the patient’s reminder response.
+- `appointment_reminders` — one row per reminder type with delivery status, retries, and the Meta message id.
 - `whatsapp_sessions.current_state = DOC_AWAITING_CONFIRMATION_DATE` and `whatsapp_sessions.context_json = <appointmentId>` — which appointment the doctor is currently assigning a date to.
 
-Production schema change for the new appointment columns:
+Production schema change:
 
 ```sql
 ALTER TABLE appointments
     ADD COLUMN awaiting_date_confirmation BOOLEAN NOT NULL DEFAULT FALSE,
-    ADD COLUMN date_confirmation_requested_at TIMESTAMP NULL;
+    ADD COLUMN date_confirmation_requested_at TIMESTAMP NULL,
+    ADD COLUMN patient_confirmation_status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+    ADD COLUMN patient_responded_at TIMESTAMP NULL;
+
+CREATE TABLE appointment_reminders (
+    reminder_id UUID PRIMARY KEY,
+    appointment_id UUID NOT NULL REFERENCES appointments(appointment_id),
+    reminder_type VARCHAR(20) NOT NULL,
+    scheduled_at TIMESTAMP NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    provider_message_id VARCHAR(255),
+    sent_at TIMESTAMP,
+    last_attempt_at TIMESTAMP,
+    next_attempt_at TIMESTAMP,
+    attempt_count INT NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    CONSTRAINT uk_appointment_reminder_type UNIQUE (appointment_id, reminder_type)
+);
+
+CREATE INDEX idx_appointment_reminders_due
+    ON appointment_reminders (status, next_attempt_at);
+
+CREATE INDEX idx_appointment_reminders_provider_message
+    ON appointment_reminders (provider_message_id);
+
+CREATE INDEX idx_appointments_start_at
+    ON appointments (start_appointment_at);
 ```
 
 ### Domain enums
@@ -548,6 +640,9 @@ ALTER TABLE appointments
 | `PatientState` | `UNDEFINED` (`POR DEFINIR`), `ON_TRACKING` (`EN SEGUIMIENTO`), `CLOSED` (`CERRADO`) |
 | `PatientPaymentState` | `COMPLETE` (`COMPLETO`), `PARTIALLY` (`PARCIALMENTE`), `IN_DEBT` (`EN DEUDA`), `UNDEFINED_PRICE` (`POR DEFINIR`) |
 | `PaymentMethod` | `CASH` (`EFECTIVO`), `TRANSFER` (`TRANSFERENCIA`) |
+| `PatientConfirmationStatus` | `PENDING`, `WAITING_PATIENT_ANSWER`, `CONFIRMED`, `CANCELLED` |
+| `ReminderType` | `THREE_DAYS`, `ONE_DAY` |
+| `ReminderStatus` | `PENDING`, `SENDING`, `SENT`, `FAILED`, `CANCELLED` |
 
 ---
 
@@ -561,7 +656,10 @@ ALTER TABLE appointments
 
 - `Project1ApplicationTests.contextLoads()` starts the full Spring context, so the datasource configuration must be resolvable.
 - `WhatsAppSignatureVerifierTest` and `WhatsAppWebhookControllerTest` cover signature validation and webhook status codes.
+- `WhatsAppWebhookPayloadTest` covers template quick-reply parsing and `context.id`.
 - `WhatsAppBotServiceDateConfirmationTest` covers the persisted doctor selection and the appointment-specific date confirmation.
+- `AppointmentReminderServiceTest` covers reminder creation, short-notice skipping, delivery state, and the later 1-day reminder rule.
+- `AppointmentConfirmationServiceTest` covers Confirmar/Cancelar, phone ownership checks, and doctor cancellation alerts.
 - There are no end-to-end bot-flow integration tests yet.
 
 ### Common pitfalls
@@ -575,6 +673,10 @@ ALTER TABLE appointments
 | Data disappears after restart | `spring.jpa.hibernate.ddl-auto=create-drop` | Use migrations and a non-destructive setting for production |
 | Doctor commands do not trigger | `DOCTOR_WHATSAPP_PHONE` does not exactly match the incoming `from` value | Confirm the international number format used by Meta |
 | Search/update/register flow resets | Those flows use in-memory `DoctorSession` state | Restart clears them; the date-confirmation selection is persisted separately |
+| Reminders do not send | Scheduler disabled, no eligible appointment, or a past short-notice reminder | Check `REMINDER_ENABLED`, `app.reminders.send-time`, `appointment_reminders`, and application logs |
+| Template reminder fails | Template not approved, wrong name/language, or malformed parameters | Verify the approved Meta template and the `REMINDER_TEMPLATE_*` values |
+| Confirmar/Cancelar does nothing | Template quick reply did not include `context.id`, or the reminder is not `SENT` | Check `appointment_reminders.provider_message_id` and the incoming `context.id` |
+| Confirmed patient still receives the 1-day reminder | This is intentional | It is a safety net; do not change without reopening the reminder decision |
 | `awaiting_date_confirmation` column missing | Production DB schema not migrated | Add the new `appointments` columns or run the migration; dev uses `ddl-auto=create-drop` |
 | Duplicate replies for one Meta event | Authenticated events return `200`; no idempotency check | Implement `WhatsAppWebhookEvent.eventKey` deduplication |
 | Webhook signature mismatch | Wrong app secret, altered/re-encoded body, or a proxy changing the payload | Ensure the raw body reaches the app unchanged; verify `WHATSAPP_APP_SECRET` |
@@ -619,6 +721,7 @@ ALTER TABLE appointments
 | ADR-0013 | No Idempotency or Retry Enforcement (Open) | Inferred from Codebase |
 | ADR-0014 | Webhook HMAC-SHA256 Signature Validation | Accepted |
 | ADR-0015 | Persistent Per-Appointment Date Confirmation | Accepted |
+| ADR-0016 | Persisted Appointment Reminders and Patient Confirmation | Accepted |
 
 ### ADR-0001: Layered Spring Boot Monolith
 
@@ -795,6 +898,28 @@ ALTER TABLE appointments
   - The `appointments` table needs new columns in production; `ddl-auto=create-drop` handles this in dev only.
   - The doctor must tap `Asignar fecha`/`Fechas` before sending a date; free-text dates without a selection show the waiting list.
 
+### ADR-0016: Persisted Appointment Reminders and Patient Confirmation
+
+- **Status:** Accepted
+- **Context:** Patients need automatic reminders 3 days and 1 day before the appointment, with one-tap Confirmar/Cancelar. Proactive messages outside WhatsApp’s 24-hour service window require approved templates. A patient may also have multiple appointments, so reminder replies must identify the exact appointment safely.
+- **Decision:**
+  - Persist delivery state in `appointment_reminders`, unique by `(appointment_id, reminder_type)`.
+  - Schedule reminders from `Appointment.startAppointmentAt` at the configured clinic time and timezone.
+  - Poll due rows with `AppointmentReminderScheduler`; claim `PENDING` rows under a write lock, then send in a separate transaction.
+  - Store Meta’s provider message id on the reminder. Template quick-reply replies are correlated through `context.id`.
+  - Keep patient confirmation separate from `appointmentStatus` with `PatientConfirmationStatus`.
+  - Mark `WAITING_PATIENT_ANSWER` after a successful send so no-response patients can be tracked.
+  - Do not cancel the 1-day reminder when the patient confirms the 3-day reminder; the later reminder remains a safety net.
+  - On Cancelar, set `appointmentStatus = CANCELLED`, cancel open reminders, and notify the doctor.
+  - Only the phone registered on the appointment may confirm or cancel it.
+  - Use an approved Meta template in production and interactive buttons only as a local-development fallback.
+- **Consequences:**
+  - Reminders survive restarts and can be retried without duplicate sends for the same date.
+  - The `appointments` and `appointment_reminders` tables need production migrations.
+  - Production setup requires an approved utility template with two quick-reply buttons.
+  - Doctor cancellation alerts use free-form text; a separate approved doctor-alert template may be needed outside the 24-hour window.
+  - The nightly rebuild job only creates missing reminders; it does not recreate or reset `SENT` rows.
+
 ### Proposed / Open ADR Topics
 
 The following decisions should be recorded next:
@@ -804,7 +929,8 @@ The following decisions should be recorded next:
 - Multi-doctor/multi-tenant authentication and authorization.
 - Database migration strategy (Flyway/Liquibase) and production `ddl-auto`.
 - REST API authentication and IDOR protection for patient/appointment endpoints.
-- Template-message support (`WhatsAppTemplate`, `TemplateParameters`).
+- Doctor cancellation alert template for outside the 24-hour WhatsApp window.
+- Reminder delivery-status webhooks and dead-letter handling.
 - Graph API rate limiting, circuit breaking, and dead-letter handling.
 - Observability: structured logging, metrics, tracing, and alerting.
 - Test strategy for bot flows and webhook parsing.
@@ -843,6 +969,8 @@ Confirm these items before deploying or extending the system:
 - Which Meta Graph API version is intended: the effective value is `v21.0` from `application.properties`; `WhatsAppProperties` still has a `v26.0` default.
 - Whether `USERNAME_DB`, `PASSWORD_DB`, `PORT_DB`, `WHATSAPP_BUSINESS_PHONE_NUMBER_ID`, and `WHATSAPP_FLOW_*` in `.env` are still used locally.
 - Whether a production secret-rotation/storage policy exists for `WHATSAPP_APP_SECRET`.
+- The exact approved reminder template name, language, button labels, and approval status in Meta Business Manager.
+- Whether the approved reminder template returns `context.id` on quick-reply taps; if not, the correlation strategy must switch to URL buttons or another token.
 - The exact international format of `DOCTOR_WHATSAPP_PHONE` expected by the current Meta account.
 - Whether the native `getAllTreatmentsIgnoreCase` query maps correctly to `SendInteractiveListRequest.Row` in the target PostgreSQL schema.
 - Whether the unmapped entities (`MessageThread`, `Message`, `BotCommand`, `Notification`, `WhatsAppTemplate`, `WhatsAppWebhookEvent`) are planned for future features.

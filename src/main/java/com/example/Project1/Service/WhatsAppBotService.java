@@ -116,6 +116,8 @@ public class WhatsAppBotService {
     private final PatientRepository patientRepository;
     private final AppointmentRepository appointmentRepository;
     private final DentistRepository dentistRepository;
+    private final AppointmentReminderService reminderService;
+    private final AppointmentConfirmationService confirmationService;
 
     public WhatsAppBotService(WhatsAppClient whatsAppClient,
                               WhatsAppProperties properties,
@@ -125,7 +127,9 @@ public class WhatsAppBotService {
                               TreatmentsRepository treatmentsRepository,
                               PatientRepository patientRepository,
                               AppointmentRepository appointmentRepository,
-                              DentistRepository dentistRepository) {
+                              DentistRepository dentistRepository,
+                              AppointmentReminderService reminderService,
+                              AppointmentConfirmationService confirmationService) {
         this.whatsAppClient = whatsAppClient;
         this.properties = properties;
         this.contactRepository = contactRepository;
@@ -135,6 +139,8 @@ public class WhatsAppBotService {
         this.patientRepository = patientRepository;
         this.appointmentRepository = appointmentRepository;
         this.dentistRepository = dentistRepository;
+        this.reminderService = reminderService;
+        this.confirmationService = confirmationService;
     }
 
     /**
@@ -202,6 +208,14 @@ public class WhatsAppBotService {
             if (handleDoctorMessage(doctorPhone, incomingMessage, messageBody, contact)) {
                 return;
             }
+        }
+
+        // -----------------------------------------------------------------------------------
+        // PATIENT REMINDER RESPONSES
+        // A Confirmar/Cancelar reply must bypass the patient intake state machine.
+        // -----------------------------------------------------------------------------------
+        if (confirmationService.handleReminderReply(fromPhone, incomingMessage)) {
+            return;
         }
 
         // -----------------------------------------------------------------------------------
@@ -545,7 +559,13 @@ public class WhatsAppBotService {
         appointment.setAppointmentStatus("CONFIRMED");
         appointment.setAwaitingDateConfirmation(false);
         appointment.setDateConfirmationRequestedAt(null);
+        // A date change requires a fresh patient response.
+        appointment.setPatientConfirmationStatus(PatientConfirmationStatus.PENDING);
+        appointment.setPatientRespondedAt(null);
         appointmentRepository.save(appointment);
+
+        // Create/update the 3-day and 1-day reminder rows.
+        reminderService.scheduleFor(appointment);
 
         clearDoctorDateSelection(contact);
 
@@ -1126,6 +1146,9 @@ public class WhatsAppBotService {
         Appointment appointment = session.selectedAppointmentId == null ? null
                 : appointmentRepository.findById(session.selectedAppointmentId).orElse(null);
 
+        boolean dateChanged = false;
+        boolean statusChanged = false;
+
         for (Map.Entry<String, Object> entry : session.pendingChanges.entrySet()) {
             String field = entry.getKey();
             Object value = entry.getValue();
@@ -1159,6 +1182,7 @@ public class WhatsAppBotService {
                 case "appointmentStatus" -> {
                     if (appointment != null) {
                         appointment.setAppointmentStatus((String) value);
+                        statusChanged = true;
                     }
                 }
                 case "notes" -> {
@@ -1176,6 +1200,7 @@ public class WhatsAppBotService {
                         LocalDateTime dateTime = (LocalDateTime) value;
                         appointment.setAppointmentDateTime(dateTime);
                         appointment.setStartAppointmentAt(Timestamp.valueOf(dateTime));
+                        dateChanged = true;
                     }
                 }
                 default -> log.warn("Unknown pending change field: {}", field);
@@ -1183,8 +1208,22 @@ public class WhatsAppBotService {
         }
 
         patientRepository.save(patient);
+
         if (appointment != null) {
+            if (dateChanged) {
+                // The old patient response no longer applies to the new date.
+                appointment.setPatientConfirmationStatus(PatientConfirmationStatus.PENDING);
+                appointment.setPatientRespondedAt(null);
+            }
+
             appointmentRepository.save(appointment);
+
+            if (statusChanged && "CANCELLED".equalsIgnoreCase(appointment.getAppointmentStatus())) {
+                reminderService.cancelFor(appointment);
+            } else if (dateChanged || statusChanged) {
+                // scheduleFor is idempotent for already-sent reminders on the same date.
+                reminderService.scheduleFor(appointment);
+            }
         }
     }
 

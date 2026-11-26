@@ -58,6 +58,10 @@ class WhatsAppBotServiceDateConfirmationTest {
     private AppointmentRepository appointmentRepository;
     @Mock
     private DentistRepository dentistRepository;
+    @Mock
+    private AppointmentReminderService reminderService;
+    @Mock
+    private AppointmentConfirmationService confirmationService;
 
     private WhatsAppBotService botService;
     private WhatsAppContact doctorContact;
@@ -78,7 +82,9 @@ class WhatsAppBotServiceDateConfirmationTest {
                 treatmentsRepository,
                 patientRepository,
                 appointmentRepository,
-                dentistRepository);
+                dentistRepository,
+                reminderService,
+                confirmationService);
 
         doctorContact = new WhatsAppContact();
         doctorContact.setWaUserId(DOCTOR_PHONE);
@@ -133,6 +139,7 @@ class WhatsAppBotServiceDateConfirmationTest {
         assertNull(doctorSession.getContextJSON());
 
         verify(appointmentRepository).save(appointment);
+        verify(reminderService).scheduleFor(appointment);
         verify(whatsAppClient).sendTextMessage(eq(PATIENT_PHONE), contains("confirmado"));
     }
 

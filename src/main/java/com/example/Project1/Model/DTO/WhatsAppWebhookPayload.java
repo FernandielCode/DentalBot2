@@ -61,11 +61,26 @@ public record WhatsAppWebhookPayload(
             String timestamp,
             String type,
             TextMessage text,
-            InteractiveReply interactive
+            InteractiveReply interactive,
+            ButtonMessage button,
+            Context context
     ) {
         /**
+         * Backwards-compatible constructor for existing tests and callers.
+         */
+        public IncomingMessage(String from,
+                               String id,
+                               String timestamp,
+                               String type,
+                               TextMessage text,
+                               InteractiveReply interactive) {
+            this(from, id, timestamp, type, text, interactive, null, null);
+        }
+
+        /**
          * Convenience helper to extract the textual content of the message,
-         * whether it was sent as plain text or selected from an interactive list/button menu.
+         * whether it was sent as plain text, an interactive reply, or a template
+         * quick-reply button.
          */
         public String getExtractedText() {
             if (text != null && text.body() != null && !text.body().isBlank()) {
@@ -79,11 +94,20 @@ public record WhatsAppWebhookPayload(
                     return interactive.buttonReply().title().trim();
                 }
             }
+            if (button != null) {
+                if (button.payload() != null && !button.payload().isBlank()) {
+                    return button.payload().trim();
+                }
+                if (button.text() != null && !button.text().isBlank()) {
+                    return button.text().trim();
+                }
+            }
             return "";
         }
 
         /**
-         * Returns the unique ID of the selected interactive option (e.g. "TRAT_1"), if applicable.
+         * Returns the unique ID of the selected interactive option (e.g. "TRAT_1"),
+         * or the template quick-reply payload when present.
          */
         public String getInteractiveSelectionId() {
             if (interactive != null) {
@@ -94,9 +118,37 @@ public record WhatsAppWebhookPayload(
                     return interactive.buttonReply().id();
                 }
             }
+            if (button != null) {
+                return button.payload();
+            }
             return null;
         }
+
+        /**
+         * Message id of the message the user replied to. For template quick replies
+         * this is the id of the reminder message we sent.
+         */
+        public String getContextMessageId() {
+            return context != null ? context.id() : null;
+        }
     }
+
+    /**
+     * Payload for a reply to a template quick-reply button.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record ButtonMessage(
+            String payload,
+            String text
+    ) {}
+
+    /**
+     * Reply context returned by Meta when a user replies to a specific message.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record Context(
+            String id
+    ) {}
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record TextMessage(

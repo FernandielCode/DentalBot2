@@ -1,6 +1,8 @@
 package com.example.Project1.Controller;
 
 import com.example.Project1.Model.Entity.Appointment;
+import com.example.Project1.Model.Entity.PatientConfirmationStatus;
+import com.example.Project1.Service.AppointmentReminderService;
 import com.example.Project1.repository.AppointmentRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
@@ -16,10 +18,13 @@ import java.util.UUID;
 public class AppointmentController {
 
     private final AppointmentRepository appointmentRepository;
+    private final AppointmentReminderService reminderService;
 
     @Autowired
-    public AppointmentController(AppointmentRepository appointmentRepository) {
+    public AppointmentController(AppointmentRepository appointmentRepository,
+                                 AppointmentReminderService reminderService) {
         this.appointmentRepository = appointmentRepository;
+        this.reminderService = reminderService;
     }
 
     @GetMapping
@@ -38,13 +43,33 @@ public class AppointmentController {
     public ResponseEntity<Appointment> updateStatus(@PathVariable UUID id, @RequestBody Map<String, String> body) {
         return appointmentRepository.findById(id)
                 .map(appointment -> {
-                    if (body.containsKey("status")) {
+                    String previousStatus = appointment.getAppointmentStatus();
+                    boolean statusChanged = body.containsKey("status");
+
+                    if (statusChanged) {
                         appointment.setAppointmentStatus(body.get("status"));
                     }
                     if (body.containsKey("notes")) {
                         appointment.setNotes(body.get("notes"));
                     }
-                    return ResponseEntity.ok(appointmentRepository.save(appointment));
+
+                    Appointment saved = appointmentRepository.save(appointment);
+
+                    if (statusChanged) {
+                        if ("CANCELLED".equalsIgnoreCase(saved.getAppointmentStatus())) {
+                            reminderService.cancelFor(saved);
+                        } else {
+                            // Reactivating a cancelled appointment requires a fresh patient answer.
+                            if ("CANCELLED".equalsIgnoreCase(previousStatus)) {
+                                saved.setPatientConfirmationStatus(PatientConfirmationStatus.PENDING);
+                                saved.setPatientRespondedAt(null);
+                                saved = appointmentRepository.save(saved);
+                            }
+                            reminderService.scheduleFor(saved);
+                        }
+                    }
+
+                    return ResponseEntity.ok(saved);
                 })
                 .orElse(ResponseEntity.notFound().build());
     }

@@ -4,12 +4,16 @@ import com.example.Project1.Config.WhatsAppProperties;
 import com.example.Project1.Model.DTO.SendInteractiveButtonRequest;
 import com.example.Project1.Model.DTO.SendInteractiveListRequest;
 import com.example.Project1.Model.DTO.SendMessageRequest;
+import com.example.Project1.Model.DTO.SendMessageResponse;
+import com.example.Project1.Model.DTO.SendTemplateMessageRequest;
+import com.example.Project1.Model.DTO.WhatsAppSendResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 
 import java.util.List;
+import java.util.UUID;
 
 /**
  * Service client responsible for dispatching HTTP requests to Meta's WhatsApp Cloud API.
@@ -113,10 +117,20 @@ public class WhatsAppClient {
 
     public boolean sendInteractiveButtons(String to, String bodyText,
                                           List<SendInteractiveButtonRequest.Button> buttons) {
-        if (properties.getPhoneNumberId() == null || properties.getPhoneNumberId().isBlank()
-                || properties.getAccessToken() == null || properties.getAccessToken().isBlank()) {
+        return sendInteractiveButtonsWithResult(to, bodyText, buttons).success();
+    }
+
+    /**
+     * Sends interactive buttons and returns Meta's message id.
+     * The message id is needed for template/quick-reply correlation.
+     */
+    public WhatsAppSendResult sendInteractiveButtonsWithResult(
+            String to,
+            String bodyText,
+            List<SendInteractiveButtonRequest.Button> buttons) {
+        if (credentialsMissing()) {
             log.warn("[LOCAL DEV SIMULATION] Buttons to {}: {} [Buttons: {}]", to, bodyText, buttons);
-            return true;
+            return WhatsAppSendResult.simulated();
         }
 
         try {
@@ -124,18 +138,82 @@ public class WhatsAppClient {
                     SendInteractiveButtonRequest.createMultipleButtons(to, bodyText, buttons);
             String uri = "/" + properties.getPhoneNumberId() + "/messages";
 
-            String response = restClient.post()
+            SendMessageResponse response = restClient.post()
                     .uri(uri)
                     .header("Authorization", "Bearer " + properties.getAccessToken())
                     .body(request)
                     .retrieve()
-                    .body(String.class);
+                    .body(SendMessageResponse.class);
 
-            log.info("Sent WhatsApp interactive buttons to {}. Response: {}", to, response);
-            return true;
+            String providerMessageId = extractProviderMessageId(response);
+            log.info("Sent WhatsApp interactive buttons to {}. Provider message id: {}",
+                    to, providerMessageId);
+            return WhatsAppSendResult.sent(providerMessageId);
         } catch (Exception e) {
             log.error("Failed to send WhatsApp interactive buttons to {}: {}", to, e.getMessage(), e);
-            return false;
+            return WhatsAppSendResult.failed(e.getMessage());
         }
+    }
+
+    /**
+     * Sends a pre-approved template message. The template defines its body and
+     * quick-reply buttons; this method supplies only the body parameters.
+     */
+    public WhatsAppSendResult sendTemplateMessage(String to,
+                                                  String templateName,
+                                                  String languageCode,
+                                                  List<String> bodyParameters) {
+        if (credentialsMissing()) {
+            log.warn("[LOCAL DEV SIMULATION] Template to {}: {} {} {}",
+                    to, templateName, languageCode, bodyParameters);
+            return WhatsAppSendResult.simulated();
+        }
+
+        try {
+            SendTemplateMessageRequest request = SendTemplateMessageRequest.create(
+                    to, templateName, languageCode, bodyParameters);
+            String uri = "/" + properties.getPhoneNumberId() + "/messages";
+
+            SendMessageResponse response = restClient.post()
+                    .uri(uri)
+                    .header("Authorization", "Bearer " + properties.getAccessToken())
+                    .body(request)
+                    .retrieve()
+                    .body(SendMessageResponse.class);
+
+            String providerMessageId = extractProviderMessageId(response);
+            log.info("Sent WhatsApp template {} to {}. Provider message id: {}",
+                    templateName, to, providerMessageId);
+            return WhatsAppSendResult.sent(providerMessageId);
+        } catch (Exception e) {
+            log.error("Failed to send WhatsApp template {} to {}: {}",
+                    templateName, to, e.getMessage(), e);
+            return WhatsAppSendResult.failed(e.getMessage());
+        }
+    }
+
+    /**
+     * Local-development reminder fallback. Production should use an approved template.
+     */
+    public WhatsAppSendResult sendReminderButtons(String to, String bodyText, UUID reminderId) {
+        return sendInteractiveButtonsWithResult(to, bodyText, List.of(
+                SendInteractiveButtonRequest.replyButton(
+                        ReminderButtonIds.CONFIRM_PREFIX + reminderId, "Confirmar"),
+                SendInteractiveButtonRequest.replyButton(
+                        ReminderButtonIds.CANCEL_PREFIX + reminderId, "Cancelar")));
+    }
+
+    private boolean credentialsMissing() {
+        return properties.getPhoneNumberId() == null
+                || properties.getPhoneNumberId().isBlank()
+                || properties.getAccessToken() == null
+                || properties.getAccessToken().isBlank();
+    }
+
+    private String extractProviderMessageId(SendMessageResponse response) {
+        if (response == null || response.messages() == null || response.messages().isEmpty()) {
+            return null;
+        }
+        return response.messages().get(0).id();
     }
 }
